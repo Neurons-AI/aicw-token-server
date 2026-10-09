@@ -1,0 +1,88 @@
+{
+  "name": "aicw-token-server",
+  "version": "0.1.0",
+  "description": "Self-hosted AI Token API server for AI Coworker: per-device keys, prepaid token wallets, OpenAI-compatible endpoints, AICW Store fulfilment.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "aicw-token-server": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./check": "./src/check/suite.ts",
+    "./protocol": "./src/protocol.ts",
+    "./d1": "./src/storage-d1.ts",
+    "./node": "./src/node.ts"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "examples",
+    "Dockerfile"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/cli.js start",
+    "dev": "node src/cli.ts start"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "hono": "4.12.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3",
+    "vitest": "~3.2.4"
+  },
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      },
+      "./check": {
+        "types": "./dist/check/suite.d.ts",
+        "import": "./dist/check/suite.js"
+      },
+      "./protocol": {
+        "types": "./dist/protocol.d.ts",
+        "import": "./dist/protocol.js"
+      },
+      "./d1": {
+        "types": "./dist/storage-d1.d.ts",
+        "import": "./dist/storage-d1.js"
+      },
+      "./node": {
+        "types": "./dist/node.d.ts",
+        "import": "./dist/node.js"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Neurons-AI/aicw-token-server.git"
+  },
+  "homepage": "https://github.com/Neurons-AI/aicw-token-server#readme",
+  "bugs": {
+    "url": "https://github.com/Neurons-AI/aicw-token-server/issues"
+  },
+  "keywords": [
+    "ai",
+    "tokens",
+    "openai-compatible",
+    "metering",
+    "aicoworker",
+    "cloudflare-workers",
+    "hono"
+  ]
+}

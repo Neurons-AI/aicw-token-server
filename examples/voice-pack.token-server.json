@@ -1,0 +1,17 @@
+{
+  "name": "Acme Voice",
+  "providerId": "acme-voice",
+  "keyPrefix": "sk-acme",
+  "publicUrl": "https://tokens.acme.example",
+  "trustedStoreKeys": ["tyM+Jt4Ch4fKlRfku6tHnBw0dpVaw33rXgGPYvSXx/U="],
+  "buckets": {
+    "voice_tokens": { "label": "voice tokens", "topup": "aicoworker://store/skills/acme-voice-100" }
+  },
+  "adapters": {
+    "openai": { "kind": "openai", "baseUrl": "https://api.openai.com/v1", "apiKeyEnv": "OPENAI_API_KEY" }
+  },
+  "models": [
+    { "id": "acme-tts", "type": "tts", "bucket": "voice_tokens", "adapter": "openai", "upstreamModel": "gpt-4o-mini-tts", "unit": "1 token = 1,000 characters read aloud", "price": { "per1kChars": 1 } },
+    { "id": "acme-transcribe", "type": "stt", "bucket": "voice_tokens", "adapter": "openai", "upstreamModel": "gpt-4o-mini-transcribe", "unit": "1 token per file", "price": { "perRequest": 1 } }
+  ]
+}

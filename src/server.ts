@@ -1,0 +1,604 @@
+/**
+ * The token server: one Hono app.
+ *
+ *   /v1/*      OpenAI-compatible API for an AI Coworker app holding a device key.
+ *   /aicw/*    Ed25519-signed calls from the AICW Store (grant, refund, key, balance).
+ *
+ * It runs unchanged on Cloudflare Workers (D1) and on Node (SQLite file): everything it
+ * needs from the outside comes in through `TokenServerDeps`.
+ */
+import { Hono, type Context } from 'hono';
+import { buildAdapters, UpstreamError, upstreamModel, type Adapter, type AdapterFactory } from './adapters/index.ts';
+import { mockAdapter } from './adapters/mock.ts';
+import { DEFAULT_LIMITS, type ModelConfig, type TokenServerConfig } from './config.ts';
+import { keyId, randomId, unb64, verifySignature } from './crypto.ts';
+import { issueKey, listKeys, revokeKeys, verifyKey, type KeyRecord } from './keys.ts';
+import { chargeForChat, estimateTokens, holdForChat, readChatUsage, tokensForImages, tokensForSpeech, tokensForVideo, tokensPerRequest, videoSeconds } from './pricing.ts';
+import {
+  balanceHeader,
+  KEY_ID_HEADER,
+  MAX_CLOCK_SKEW_MS,
+  PROTOCOL_VERSION,
+  SIGNATURE_HEADER,
+  WELL_KNOWN_PATH,
+  type AdjustRequest,
+  type ApiError,
+  type BalanceRequest,
+  type FulfillRequest,
+  type KeyRequest,
+  type KeyRevokeRequest,
+  type ModelType,
+  type ProviderDescriptor,
+  type PublicModel,
+  type RefundRequest,
+  type ServerManifest,
+  type VideoJob,
+} from './protocol.ts';
+import type { Storage } from './storage.ts';
+import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
+
+export const LIBRARY = { name: 'aicw-token-server', version: '0.1.0' };
+
+export interface TokenServerDeps {
+  config: TokenServerConfig;
+  storage: Storage;
+  /** Where upstream keys are read from (process.env, or a Worker's env). */
+  env?: Record<string, string | undefined>;
+  fetch?: typeof fetch;
+  /** Adapter kinds of your own, next to the built-in `openai`, `byteplus`, `mock`. */
+  adapters?: Record<string, AdapterFactory>;
+  log?: (event: string, data: Record<string, unknown>) => void;
+}
+type Vars = { key: KeyRecord; test: boolean };
+type C = Context<{ Variables: Vars }>;
+
+class HttpError extends Error {
+  status: number;
+  body: ApiError;
+  constructor(status: number, code: string, message: string, extra: Partial<ApiError['error']> = {}) {
+    super(message);
+    this.status = status;
+    this.body = { error: { message, type: status >= 500 ? 'server_error' : status === 402 ? 'insufficient_tokens' : 'invalid_request_error', code, ...extra } };
+  }
+}
+const bad = (message: string, code = 'invalid_request') => new HttpError(400, code, message);
+const str = (v: unknown, max = 200) => (typeof v === 'string' ? v.slice(0, max) : '');
+const nowIso = () => new Date().toISOString();
+
+export function createTokenServer(deps: TokenServerDeps) {
+  const { config, storage: db } = deps;
+  const env = deps.env ?? {};
+  const fetchImpl = deps.fetch ?? fetch;
+  const log = deps.log ?? (() => {});
+  const limits = { ...DEFAULT_LIMITS, ...(config.limits ?? {}) };
+  const adapters = buildAdapters(config, env, fetchImpl, deps.adapters);
+  /** Test accounts (the conformance check) are always answered by this, never by a real upstream. */
+  const sandbox = mockAdapter();
+  const baseUrl = `${config.publicUrl.replace(/\/+$/, '')}/v1`;
+  const publicModels: PublicModel[] = config.models.map((m) => ({ id: m.id, type: m.type, bucket: m.bucket, ...(m.unit ? { unit: m.unit } : {}) }));
+  const provider: ProviderDescriptor = { id: config.providerId, name: config.name, baseUrl, models: publicModels };
+  const manifest: ServerManifest = {
+    protocol: PROTOCOL_VERSION,
+    name: config.name,
+    providerId: config.providerId,
+    baseUrl,
+    buckets: Object.entries(config.buckets).map(([id, b]) => ({ id, label: b.label })),
+    models: publicModels,
+    library: LIBRARY,
+  };
+  const trusted = new Map<string, string>();
+  const trustedReady = (async () => {
+    for (const k of config.trustedStoreKeys) trusted.set(await keyId(unb64(k)), k);
+  })();
+
+  const modelOf = (id: unknown, types: ModelType[]): ModelConfig => {
+    const name = str(id, 200);
+    const m = config.models.find((x) => x.id === name);
+    if (!m) throw new HttpError(404, 'model_not_found', name ? `this server has no model "${name}"` : 'the request names no model');
+    if (!types.includes(m.type)) throw bad(`"${m.id}" is a ${m.type} model; this endpoint takes ${types.join(' or ')} models`, 'wrong_model_type');
+    return m;
+  };
+  const adapterFor = (c: C, m: ModelConfig): Adapter => (c.get('test') ? sandbox : adapters[m.adapter]);
+  const insufficient = (e: WalletError) =>
+    new HttpError(402, 'insufficient_tokens', `not enough ${config.buckets[e.bucket]?.label || e.bucket}: ${e.balance} left, this call needs ${e.needed}`, {
+      bucket: e.bucket,
+      balance: e.balance,
+      needed: e.needed,
+      ...(config.buckets[e.bucket]?.topup ? { topup: config.buckets[e.bucket].topup } : {}),
+    });
+  const reserve = async (c: C, m: ModelConfig, amount: number, mode: 'exact' | 'upTo', kind: string) => {
+    try {
+      return await hold(db, { accountRef: c.get('key').account_ref, keyId: c.get('key').id, bucket: m.bucket, amount, mode, kind, model: m.id });
+    } catch (e) {
+      if (e instanceof WalletError) throw insufficient(e);
+      throw e;
+    }
+  };
+  /** An upstream failure, as the caller should see it. A refusal (400) passes through; the rest is "upstream unavailable". */
+  const upstreamFailure = async (res: Response): Promise<HttpError> => {
+    const data = (await res.json().catch(() => null)) as { error?: { message?: string; code?: string } } | null;
+    const message = str(data?.error?.message, 600) || `the model provider answered ${res.status}`;
+    if (res.status === 400 || res.status === 422) return new HttpError(400, str(data?.error?.code, 80) || 'upstream_rejected', message);
+    log('upstream_failed', { status: res.status, message });
+    return new HttpError(res.status === 429 ? 503 : 502, 'upstream_unavailable', res.status === 429 ? 'the model provider is rate limiting this server; try again shortly' : 'the model provider is unavailable; nothing was charged');
+  };
+  const failure = (e: unknown): HttpError => {
+    if (e instanceof HttpError) return e;
+    if (e instanceof UpstreamError) return new HttpError(e.status === 400 ? 400 : e.status === 404 ? 404 : e.status === 503 ? 503 : 502, e.code, e.message);
+    const anyE = e as { status?: number; code?: string; message?: string };
+    if (anyE?.status === 400) return new HttpError(400, anyE.code || 'upstream_rejected', anyE.message || 'the request was refused');
+    log('request_failed', { message: e instanceof Error ? e.message : String(e) });
+    return new HttpError(502, 'upstream_unavailable', 'the model provider is unavailable; nothing was charged');
+  };
+  const withBalance = (res: Response, bucket: string, balance: number | null): Response => {
+    if (balance === null) return res;
+    const headers = new Headers(res.headers);
+    headers.set(balanceHeader(bucket), String(balance));
+    return new Response(res.body, { status: res.status, headers });
+  };
+  const jsonBody = async (c: C): Promise<Record<string, any>> => {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('the request body must be a JSON object');
+    return body as Record<string, any>;
+  };
+
+  const app = new Hono<{ Variables: Vars }>();
+  app.onError((e, c) => {
+    const err = e instanceof HttpError ? e : failure(e);
+    return c.json(err.body, err.status as 400);
+  });
+  app.notFound((c) => c.json({ error: { message: 'no such route', type: 'invalid_request_error', code: 'not_found' } }, 404));
+  app.use('*', async (c, next) => {
+    const length = Number(c.req.header('content-length') || 0);
+    if (length > limits.maxBodyBytes) throw new HttpError(413, 'request_too_large', `the request is larger than ${limits.maxBodyBytes} bytes`);
+    await next();
+    c.header('x-content-type-options', 'nosniff');
+    if (!c.res.headers.has('cache-control')) c.header('cache-control', 'no-store');
+  });
+
+  app.get('/healthz', (c) => c.json({ ok: true, name: config.name, protocol: PROTOCOL_VERSION }));
+  app.get(WELL_KNOWN_PATH, (c) => c.json(manifest));
+
+  // ───────────────────────────── /v1: device key ─────────────────────────────
+  app.use('/v1/*', async (c, next) => {
+    const token = c.req.header('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1] || c.req.header('x-api-key') || '';
+    const key = await verifyKey(db, token.trim());
+    if (!key) throw new HttpError(401, 'invalid_api_key', 'this key is unknown or was revoked; reinstall the package from the AICW Store to get a new one');
+    const bucket = `key:${key.id}:${Math.floor(Date.now() / 60_000)}`;
+    const hit = await db.first<{ hits: number }>(
+      'INSERT INTO ts_rate(key,hits,expires_at) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET hits=hits+1 RETURNING hits',
+      bucket,
+      new Date(Date.now() + 120_000).toISOString()
+    );
+    if ((hit?.hits ?? 0) > limits.requestsPerMinute) throw new HttpError(429, 'rate_limited', `more than ${limits.requestsPerMinute} requests in a minute; slow down`);
+    c.set('key', key);
+    c.set('test', await isTestAccount(db, key.account_ref));
+    await next();
+  });
+
+  app.get('/v1/models', (c) => {
+    const data = publicModels.map((m) => ({ id: m.id, object: 'model', owned_by: config.providerId, type: m.type, bucket: m.bucket }));
+    return c.json({ object: 'list', data, models: data });
+  });
+  app.get('/v1/me/balance', async (c) => {
+    const b = await balances(db, c.get('key').account_ref);
+    for (const id of Object.keys(config.buckets)) {
+      b.balances[id] ??= 0;
+      b.held[id] ??= 0;
+    }
+    return c.json({ balances: b.balances, held: b.held, buckets: manifest.buckets, updatedAt: b.updatedAt || nowIso() });
+  });
+
+  /** Chat Completions and Responses: forward, meter the usage the upstream reports, settle. */
+  const chat = (path: '/chat/completions' | '/responses') => async (c: C) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['chat']);
+    const promptChars = JSON.stringify(body.messages ?? body.input ?? '').length + JSON.stringify(body.tools ?? '').length + str(body.instructions, 1_000_000).length;
+    const h = await reserve(c, m, holdForChat(m, body, promptChars), 'upTo', path === '/responses' ? 'responses' : 'chat');
+    const stream = body.stream === true;
+    const send: Record<string, any> = { ...body, model: upstreamModel(m) };
+    if (stream && path === '/chat/completions') send.stream_options = { ...(body.stream_options ?? {}), include_usage: true };
+    // Never let one call spend more than was reserved for it.
+    const cap = Math.max(1, Math.floor((h.amount - estimateTokens(promptChars) * (m.price?.input ?? 1)) / (m.price?.output ?? 1)));
+    const maxField = path === '/responses' ? 'max_output_tokens' : body.max_tokens !== undefined && body.max_completion_tokens === undefined ? 'max_tokens' : 'max_completion_tokens';
+    const asked = Number(send[maxField]) || 0;
+    if (!asked || asked > cap) send[maxField] = Math.max(16, cap);
+    let res: Response;
+    try {
+      res = await adapterFor(c, m).forward(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(send), signal: c.req.raw.signal });
+    } catch (e) {
+      await release(db, h.requestId, e instanceof Error ? e.message : String(e));
+      throw failure(e);
+    }
+    if (!res.ok) {
+      const err = await upstreamFailure(res);
+      await release(db, h.requestId, err.message);
+      throw err;
+    }
+    if (!stream) {
+      const data = (await res.json().catch(() => null)) as Record<string, any> | null;
+      const usage = readChatUsage(data?.usage);
+      if (!data) {
+        await release(db, h.requestId, 'unreadable upstream answer');
+        throw new HttpError(502, 'upstream_unavailable', 'the model provider sent an unreadable answer; nothing was charged');
+      }
+      // No usage reported: charge the estimate rather than nothing, or everything.
+      const charged = usage ? chargeForChat(m, usage) : estimateTokens(promptChars + JSON.stringify(data.choices ?? data.output ?? '').length);
+      const balance = await settle(db, h.requestId, charged, data.usage ?? { estimated: true });
+      if (data.model) data.model = m.id;
+      return withBalance(Response.json(data), m.bucket, balance);
+    }
+    return new Response(meterSse(res.body!, async (seen) => {
+      const usage = readChatUsage(seen.usage);
+      await settle(db, h.requestId, usage ? chargeForChat(m, usage) : estimateTokens(promptChars + seen.outputChars), seen.usage ?? { estimated: true, aborted: seen.aborted });
+    }), { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', [balanceHeader(m.bucket)]: String(h.balanceAfter) } });
+  };
+  app.post('/v1/chat/completions', chat('/chat/completions'));
+  app.post('/v1/responses', chat('/responses'));
+
+  app.post('/v1/embeddings', async (c) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['embedding']);
+    const chars = JSON.stringify(body.input ?? '').length;
+    const h = await reserve(c, m, Math.ceil(estimateTokens(chars) * 2 * (m.price?.input ?? 1)), 'upTo', 'embedding');
+    return guarded(h.requestId, async () => {
+      const res = await adapterFor(c, m).forward('/embeddings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, model: upstreamModel(m) }) });
+      if (!res.ok) throw await upstreamFailure(res);
+      const data = (await res.json()) as Record<string, any>;
+      const total = Number(data?.usage?.total_tokens) || estimateTokens(chars);
+      const balance = await settle(db, h.requestId, Math.ceil(total * (m.price?.input ?? 1)), data.usage);
+      return withBalance(Response.json({ ...data, model: m.id }), m.bucket, balance);
+    });
+  });
+
+  /** Run a call that either settles itself or, on any failure, gives the hold back. */
+  async function guarded(requestId: string, run: () => Promise<Response>): Promise<Response> {
+    try {
+      return await run();
+    } catch (e) {
+      const err = failure(e);
+      await release(db, requestId, err.message);
+      throw err;
+    }
+  }
+
+  app.post('/v1/images/generations', async (c) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['image']);
+    if (!str(body.prompt, 32_000).trim()) throw bad('an image needs a prompt');
+    const n = Math.max(1, Math.min(4, Math.trunc(Number(body.n)) || 1));
+    const h = await reserve(c, m, tokensForImages(m, str(body.quality, 20), n, false), 'exact', 'image');
+    return guarded(h.requestId, async () => {
+      const res = await adapterFor(c, m).forward('/images/generations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, n, model: upstreamModel(m) }) });
+      if (!res.ok) throw await upstreamFailure(res);
+      const data = (await res.json()) as Record<string, any>;
+      const made = Array.isArray(data?.data) ? data.data.length : 0;
+      if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
+      const balance = await settle(db, h.requestId, tokensForImages(m, str(body.quality, 20), made, false), { images: made, quality: body.quality ?? 'auto' });
+      return withBalance(Response.json(data), m.bucket, balance);
+    });
+  });
+  app.post('/v1/images/edits', async (c) => {
+    const form = await c.req.formData().catch(() => null);
+    if (!form) throw bad('send the edit as multipart/form-data');
+    const m = modelOf(form.get('model'), ['image']);
+    if (!str(form.get('prompt'), 32_000).trim()) throw bad('an image edit needs a prompt');
+    const n = Math.max(1, Math.min(4, Math.trunc(Number(form.get('n'))) || 1));
+    const quality = str(form.get('quality'), 20);
+    const h = await reserve(c, m, tokensForImages(m, quality, n, true), 'exact', 'image');
+    return guarded(h.requestId, async () => {
+      form.set('model', upstreamModel(m));
+      form.set('n', String(n));
+      const res = await adapterFor(c, m).forward('/images/edits', { method: 'POST', body: form });
+      if (!res.ok) throw await upstreamFailure(res);
+      const data = (await res.json()) as Record<string, any>;
+      const made = Array.isArray(data?.data) ? data.data.length : 0;
+      if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
+      const balance = await settle(db, h.requestId, tokensForImages(m, quality, made, true), { images: made, quality: quality || 'auto', edit: true });
+      return withBalance(Response.json(data), m.bucket, balance);
+    });
+  });
+
+  app.post('/v1/audio/speech', async (c) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['tts']);
+    const text = str(body.input, 100_000);
+    if (!text.trim()) throw bad('speech needs an input text');
+    const cost = tokensForSpeech(m, text.length);
+    const h = await reserve(c, m, cost, 'exact', 'tts');
+    return guarded(h.requestId, async () => {
+      const res = await adapterFor(c, m).forward('/audio/speech', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, model: upstreamModel(m) }) });
+      if (!res.ok) throw await upstreamFailure(res);
+      const audio = await res.arrayBuffer();
+      const balance = await settle(db, h.requestId, cost, { chars: text.length });
+      return withBalance(new Response(audio, { headers: { 'content-type': res.headers.get('content-type') || 'audio/mpeg' } }), m.bucket, balance);
+    });
+  });
+  app.post('/v1/audio/transcriptions', async (c) => {
+    const form = await c.req.formData().catch(() => null);
+    if (!form) throw bad('send the audio as multipart/form-data');
+    const m = modelOf(form.get('model'), ['stt']);
+    const cost = tokensPerRequest(m);
+    const h = await reserve(c, m, cost, 'exact', 'stt');
+    return guarded(h.requestId, async () => {
+      form.set('model', upstreamModel(m));
+      const res = await adapterFor(c, m).forward('/audio/transcriptions', { method: 'POST', body: form });
+      if (!res.ok) throw await upstreamFailure(res);
+      const text = await res.text();
+      const balance = await settle(db, h.requestId, cost, {});
+      return withBalance(new Response(text, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
+    });
+  });
+
+  /** Any other model type (music, 3D, …): one JSON call, charged per request. */
+  app.post('/v1/generate', async (c) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['other']);
+    const cost = tokensPerRequest(m);
+    const h = await reserve(c, m, cost, 'exact', 'other');
+    return guarded(h.requestId, async () => {
+      const res = await adapterFor(c, m).forward('/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, model: upstreamModel(m) }) });
+      if (!res.ok) throw await upstreamFailure(res);
+      const payload = await res.arrayBuffer();
+      const balance = await settle(db, h.requestId, cost, {});
+      return withBalance(new Response(payload, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
+    });
+  });
+
+  // ───────────────────────────── video: a job, not a call ─────────────────────────────
+  interface VideoRow {
+    id: string;
+    account_ref: string;
+    model: string;
+    bucket: string;
+    status: string;
+    hold: number;
+    upstream_id: string | null;
+    upstream_ref: string | null;
+    error: string | null;
+    created_at: string;
+  }
+  const videoRow = (id: string) => db.first<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at FROM ts_requests WHERE id=? AND kind='video'", id);
+  /** Ask the upstream where a job is, and settle or release the hold when it has ended. */
+  async function advanceVideo(row: VideoRow, test: boolean): Promise<VideoJob> {
+    const job = (status: VideoJob['status'], extra: Partial<VideoJob> = {}): VideoJob => ({ id: row.id, object: 'video', model: row.model, status, ...extra });
+    const done = () => job('completed', { progress: 100, url: `${baseUrl}/videos/${row.id}/content` });
+    if (row.status === 'done') return done();
+    if (row.status === 'released') return job('failed', { error: { message: row.error || 'the video could not be made; nothing was charged', code: 'video_failed' } });
+    const m = config.models.find((x) => x.id === row.model);
+    const video = (test ? sandbox : m ? adapters[m.adapter] : undefined)?.video;
+    if (!video || !row.upstream_id) return job('queued');
+    let state;
+    try {
+      state = await video.status(row.upstream_id);
+    } catch (e) {
+      log('video_status_failed', { id: row.id, message: e instanceof Error ? e.message : String(e) });
+      return job('in_progress');
+    }
+    if (state.status === 'completed') {
+      await db.run('UPDATE ts_requests SET upstream_ref=? WHERE id=?', state.ref ?? null, row.id);
+      await settle(db, row.id, row.hold, { video: true });
+      return done();
+    }
+    if (state.status === 'failed') {
+      await release(db, row.id, state.error || 'the video could not be made');
+      return job('failed', { error: { message: `${state.error || 'the video could not be made'}; nothing was charged`, code: 'video_failed' } });
+    }
+    return job(state.status, { progress: state.progress });
+  }
+
+  app.post('/v1/videos', async (c) => {
+    const body = await jsonBody(c);
+    const m = modelOf(body.model, ['video']);
+    const prompt = str(body.prompt, 8000).trim();
+    if (!prompt) throw bad('a video needs a prompt');
+    const resolution = str(body.resolution, 10) || '720p';
+    if (m.price?.resolution && !(resolution in m.price.resolution)) throw bad(`resolution must be one of ${Object.keys(m.price.resolution).join(', ')}`);
+    const seconds = videoSeconds(m, body.duration ?? body.seconds);
+    const images = (Array.isArray(body.images) ? body.images : body.image ? [body.image] : []).filter((x: unknown): x is string => typeof x === 'string' && /^(https?:|data:image\/)/.test(x)).slice(0, 4);
+    const open = await db.first<{ n: number }>("SELECT COUNT(*) AS n FROM ts_requests WHERE account_ref=? AND kind='video' AND status='held'", c.get('key').account_ref);
+    if ((open?.n ?? 0) >= limits.maxOpenVideos) throw new HttpError(429, 'too_many_videos', `${limits.maxOpenVideos} videos are already being made; wait for one to finish`);
+    const video = adapterFor(c, m).video;
+    if (!video) throw new HttpError(503, 'upstream_not_configured', `the "${m.adapter}" adapter cannot make videos`);
+    const h = await reserve(c, m, tokensForVideo(m, resolution, seconds), 'exact', 'video');
+    return guarded(h.requestId, async () => {
+      const made = await video.create({ model: upstreamModel(m), prompt, images, resolution, seconds, ratio: str(body.ratio ?? body.aspect_ratio, 10) || undefined });
+      await db.run('UPDATE ts_requests SET upstream_id=?,usage_json=? WHERE id=?', made.id, JSON.stringify({ resolution, seconds }), h.requestId);
+      const job: VideoJob = { id: h.requestId, object: 'video', model: m.id, status: 'queued' };
+      return withBalance(Response.json(job), m.bucket, h.balanceAfter);
+    });
+  });
+  app.get('/v1/videos/:id', async (c) => {
+    const row = await videoRow(c.req.param('id'));
+    if (!row || row.account_ref !== c.get('key').account_ref) throw new HttpError(404, 'not_found', 'no such video');
+    return c.json(await advanceVideo(row, c.get('test')));
+  });
+  app.get('/v1/videos/:id/content', async (c) => {
+    const row = await videoRow(c.req.param('id'));
+    if (!row || row.account_ref !== c.get('key').account_ref) throw new HttpError(404, 'not_found', 'no such video');
+    if (row.status !== 'done') throw new HttpError(409, 'not_ready', 'the video is not finished yet');
+    const m = config.models.find((x) => x.id === row.model);
+    const video = (c.get('test') ? sandbox : m ? adapters[m.adapter] : undefined)?.video;
+    if (!video) throw new HttpError(404, 'not_found', 'the video is no longer available');
+    const res = await video.content(row.upstream_id || '', row.upstream_ref || undefined).catch((e) => {
+      throw failure(e);
+    });
+    if (!res.ok) throw new HttpError(res.status === 404 || res.status === 403 ? 404 : 502, 'not_found', 'the video file is no longer available (files are kept for about a day)');
+    return new Response(res.body, { headers: { 'content-type': res.headers.get('content-type') || 'video/mp4', ...(res.headers.get('content-length') ? { 'content-length': res.headers.get('content-length')! } : {}) } });
+  });
+
+  // ───────────────────────────── /aicw: the Store, signed ─────────────────────────────
+  /** Read a signed body. The signature covers the exact bytes sent; `ts` bounds how long it is good for. */
+  async function signed<T extends { ts: string }>(c: Context): Promise<T> {
+    await trustedReady;
+    const raw = await c.req.text();
+    const key = trusted.get(c.req.header(KEY_ID_HEADER) || '');
+    const signature = c.req.header(SIGNATURE_HEADER) || '';
+    if (!key || !signature || !(await verifySignature(key, raw, signature))) throw new HttpError(401, 'bad_signature', 'this request is not signed by a Store this server trusts');
+    let body: T;
+    try {
+      body = JSON.parse(raw) as T;
+    } catch {
+      throw bad('the signed body must be JSON');
+    }
+    const at = Date.parse(String(body?.ts));
+    if (!Number.isFinite(at) || Math.abs(Date.now() - at) > MAX_CLOCK_SKEW_MS) throw new HttpError(401, 'stale_request', 'the signed request is too old or carries no time');
+    return body;
+  }
+  const ref = (v: unknown, what: string) => {
+    const s = str(v, 200);
+    if (!/^[A-Za-z0-9._:-]{6,200}$/.test(s)) throw bad(`${what} is missing or malformed`);
+    return s;
+  };
+
+  app.post('/aicw/fulfill', async (c) => {
+    const body = await signed<FulfillRequest>(c);
+    const receiptId = ref(body.receiptId, 'receiptId');
+    const accountRef = ref(body.accountRef, 'accountRef');
+    const grants = Array.isArray(body.grants) ? body.grants : [];
+    if (!grants.length) throw bad('the receipt grants nothing');
+    for (const g of grants) {
+      if (!config.buckets[g?.bucket]) throw bad(`this server has no bucket "${g?.bucket}"`, 'unknown_bucket');
+      if (!Number.isInteger(g.amount) || g.amount <= 0 || g.amount > 1e12) throw bad(`the amount for "${g.bucket}" must be a positive whole number`);
+    }
+    const applied = await grantReceipt(db, { receiptId, accountRef, sku: str(body.sku, 120) || 'unknown', orderRef: str(body.orderRef, 120) || receiptId, grants: grants.map((g) => ({ bucket: g.bucket, amount: g.amount })), test: body.test === true });
+    log('fulfill', { receiptId, applied });
+    return c.json({ ok: true, applied, balances: (await balances(db, accountRef)).balances });
+  });
+  app.post('/aicw/refund', async (c) => {
+    const body = await signed<RefundRequest>(c);
+    const result = await refundReceipt(db, ref(body.receiptId, 'receiptId'));
+    if (!result) throw new HttpError(404, 'unknown_receipt', 'this server never fulfilled that receipt');
+    log('refund', { receiptId: body.receiptId, applied: result.applied });
+    return c.json({ ok: true, ...result });
+  });
+  app.post('/aicw/keys', async (c) => {
+    const body = await signed<KeyRequest>(c);
+    const accountRef = ref(body.accountRef, 'accountRef');
+    const deviceRef = ref(body.deviceRef, 'deviceRef');
+    await ensureAccount(db, accountRef, body.test === true);
+    const issued = await issueKey(db, config.keyPrefix, accountRef, deviceRef);
+    return c.json({ ok: true, key: issued.key, prefix: issued.prefix, provider });
+  });
+  app.post('/aicw/keys/revoke', async (c) => {
+    const body = await signed<KeyRevokeRequest>(c);
+    return c.json({ ok: true, revoked: await revokeKeys(db, ref(body.accountRef, 'accountRef'), body.deviceRef ? ref(body.deviceRef, 'deviceRef') : undefined) });
+  });
+  app.post('/aicw/balance', async (c) => {
+    const body = await signed<BalanceRequest>(c);
+    const accountRef = ref(body.accountRef, 'accountRef');
+    const b = await balances(db, accountRef);
+    for (const id of Object.keys(config.buckets)) {
+      b.balances[id] ??= 0;
+      b.held[id] ??= 0;
+    }
+    const keys = (await listKeys(db, accountRef)).map((k) => ({ prefix: k.prefix, deviceRef: k.device_ref, status: k.status, createdAt: k.created_at, lastUsedAt: k.last_used_at }));
+    const usage = await usageSummary(db, accountRef, new Date(Date.now() - 30 * 86_400_000).toISOString());
+    return c.json({ ok: true, balances: b.balances, held: b.held, keys, usage });
+  });
+  app.post('/aicw/adjust', async (c) => {
+    const body = await signed<AdjustRequest>(c);
+    if (!config.allowStoreAdjust) throw new HttpError(403, 'adjust_disabled', 'this server does not let the Store correct balances');
+    if (!config.buckets[body.bucket]) throw bad(`this server has no bucket "${body.bucket}"`, 'unknown_bucket');
+    if (!Number.isInteger(body.delta) || body.delta === 0 || Math.abs(body.delta) > 1e12) throw bad('delta must be a non-zero whole number');
+    const applied = await adjust(db, { accountRef: ref(body.accountRef, 'accountRef'), bucket: body.bucket, delta: body.delta, ref: ref(body.ref, 'ref'), note: str(body.note, 300) || undefined });
+    return c.json({ ok: true, applied, balances: (await balances(db, body.accountRef)).balances });
+  });
+
+  /**
+   * Housekeeping, to call every few minutes (a cron on Workers, a timer on Node): finish video
+   * jobs nobody polled, give back holds of calls that died, drop old rate-limit rows.
+   */
+  async function sweep(): Promise<{ videos: number; released: number }> {
+    let videos = 0;
+    let released = 0;
+    const stamp = nowIso();
+    await db.run('DELETE FROM ts_rate WHERE expires_at<?', stamp);
+    const open = await db.all<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at FROM ts_requests WHERE kind='video' AND status='held' AND created_at<? LIMIT 50", new Date(Date.now() - 60_000).toISOString());
+    for (const row of open) {
+      const job = await advanceVideo(row, await isTestAccount(db, row.account_ref));
+      if (job.status === 'completed' || job.status === 'failed') videos++;
+      else if (Date.parse(row.created_at) < Date.now() - 2 * 3600_000) {
+        await release(db, row.id, 'the video did not finish in two hours');
+        released++;
+      }
+    }
+    // A chat or image call that never settled (the process died mid-call): 15 minutes is far past any timeout.
+    const dead = await db.all<{ id: string }>("SELECT id FROM ts_requests WHERE kind<>'video' AND status='held' AND created_at<? LIMIT 200", new Date(Date.now() - 15 * 60_000).toISOString());
+    for (const row of dead) {
+      await release(db, row.id, 'the call never finished');
+      released++;
+    }
+    return { videos, released };
+  }
+
+  return { app, fetch: app.fetch, manifest, provider, sweep };
+}
+
+/**
+ * Pass an SSE stream through untouched while reading it: the last `usage` object seen and how
+ * much text went out. `done` runs exactly once, when the stream ends or the client goes away.
+ */
+export function meterSse(upstream: ReadableStream<Uint8Array>, done: (seen: { usage: unknown; outputChars: number; aborted: boolean }) => Promise<void>): ReadableStream<Uint8Array> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let usage: unknown = null;
+  let outputChars = 0;
+  let finished = false;
+  const finish = async (aborted: boolean) => {
+    if (finished) return;
+    finished = true;
+    try {
+      await done({ usage, outputChars, aborted });
+    } catch {
+      /* the sweep gives the hold back */
+    }
+  };
+  const read = (line: string) => {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    try {
+      const obj = JSON.parse(data) as Record<string, any>;
+      const u = obj.usage ?? obj.response?.usage;
+      if (u) usage = u;
+      const delta = obj.choices?.[0]?.delta;
+      if (typeof delta?.content === 'string') outputChars += delta.content.length;
+      if (typeof delta?.reasoning_content === 'string') outputChars += delta.reasoning_content.length;
+      if (Array.isArray(delta?.tool_calls)) outputChars += JSON.stringify(delta.tool_calls).length;
+      if (typeof obj.delta === 'string') outputChars += obj.delta.length;
+    } catch {
+      /* not JSON: pass it through, nothing to meter */
+    }
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done: end } = await reader.read();
+        if (end) {
+          if (buffer) read(buffer);
+          await finish(false);
+          controller.close();
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          read(buffer.slice(0, nl).trimEnd());
+          buffer = buffer.slice(nl + 1);
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        await finish(true);
+        controller.error(e);
+      }
+    },
+    async cancel(reason) {
+      await finish(true);
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
+}
+
+export const newRequestId = randomId;
