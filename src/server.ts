@@ -13,9 +13,11 @@ import { mockAdapter } from './adapters/mock.ts';
 import { DEFAULT_LIMITS, type ModelConfig, type TokenServerConfig } from './config.ts';
 import { keyId, randomId, unb64, verifySignature } from './crypto.ts';
 import { issueKey, listKeys, revokeKeys, verifyKey, type KeyRecord } from './keys.ts';
+import { checkEstimate, checkPrice, fullPrice, liveCatalog, overrideLog, readOverrides, writeOverride, type LiveCatalog } from './prices.ts';
 import { chargeForChat, estimateTokens, holdForChat, readChatUsage, tokensForImages, tokensForSpeech, tokensForVideo, tokensPerRequest, videoSeconds } from './pricing.ts';
 import {
   balanceHeader,
+  quotaHeader,
   KEY_ID_HEADER,
   MAX_CLOCK_SKEW_MS,
   PROTOCOL_VERSION,
@@ -24,6 +26,10 @@ import {
   type AdjustRequest,
   type ApiError,
   type BalanceRequest,
+  type PricesResponse,
+  type PublicBucket,
+  type SetEstimateRequest,
+  type SetPriceRequest,
   type FulfillRequest,
   type KeyRequest,
   type KeyRevokeRequest,
@@ -37,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.1.0' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.2.0' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
@@ -75,32 +81,53 @@ export function createTokenServer(deps: TokenServerDeps) {
   /** Test accounts (the conformance check) are always answered by this, never by a real upstream. */
   const sandbox = mockAdapter();
   const baseUrl = `${config.publicUrl.replace(/\/+$/, '')}/v1`;
-  const publicModels: PublicModel[] = config.models.map((m) => ({ id: m.id, type: m.type, bucket: m.bucket, ...(m.unit ? { unit: m.unit } : {}) }));
-  const provider: ProviderDescriptor = { id: config.providerId, name: config.name, baseUrl, models: publicModels };
-  const manifest: ServerManifest = {
-    protocol: PROTOCOL_VERSION,
-    name: config.name,
-    providerId: config.providerId,
-    baseUrl,
-    buckets: Object.entries(config.buckets).map(([id, b]) => ({ id, label: b.label })),
-    models: publicModels,
-    library: LIBRARY,
+  /** The live catalog: prices the Store replaced (when allowed) over the configured ones, and each bucket's estimate. */
+  interface Live {
+    catalog: LiveCatalog;
+    models: PublicModel[];
+    buckets: PublicBucket[];
+    provider: ProviderDescriptor;
+    manifest: ServerManifest;
+  }
+  const describe = (catalog: LiveCatalog): Live => {
+    const models: PublicModel[] = catalog.models.map((m) => ({ id: m.id, type: m.type, bucket: m.bucket, ...(m.unit ? { unit: m.unit } : {}) }));
+    const buckets: PublicBucket[] = Object.entries(config.buckets).map(([id, b]) => ({ id, label: b.label, ...(catalog.estimates[id] ? { estimate: catalog.estimates[id] } : {}) }));
+    return {
+      catalog,
+      models,
+      buckets,
+      provider: { id: config.providerId, name: config.name, baseUrl, models },
+      manifest: { protocol: PROTOCOL_VERSION, name: config.name, providerId: config.providerId, baseUrl, buckets, models, library: LIBRARY },
+    };
   };
+  const configured = describe(liveCatalog(config, { prices: new Map(), estimates: new Map() }));
+  /** Read again at most every 15 s per process (other instances pick a change up within that). */
+  let live: { at: number; value: Promise<Live> } | null = null;
+  const current = (): Promise<Live> => {
+    if (!config.allowStorePricing) return Promise.resolve(configured);
+    if (!live || Date.now() - live.at > 15_000) {
+      const value = readOverrides(db).then((o) => describe(liveCatalog(config, o)), () => configured);
+      live = { at: Date.now(), value };
+    }
+    return live.value;
+  };
+  const provider = configured.provider;
+  const manifest = configured.manifest;
   const trusted = new Map<string, string>();
   const trustedReady = (async () => {
     for (const k of config.trustedStoreKeys) trusted.set(await keyId(unb64(k)), k);
   })();
 
-  const modelOf = (id: unknown, types: ModelType[]): ModelConfig => {
+  const modelOf = async (id: unknown, types: ModelType[]): Promise<ModelConfig> => {
     const name = str(id, 200);
-    const m = config.models.find((x) => x.id === name);
+    const m = (await current()).catalog.models.find((x) => x.id === name);
     if (!m) throw new HttpError(404, 'model_not_found', name ? `this server has no model "${name}"` : 'the request names no model');
     if (!types.includes(m.type)) throw bad(`"${m.id}" is a ${m.type} model; this endpoint takes ${types.join(' or ')} models`, 'wrong_model_type');
     return m;
   };
   const adapterFor = (c: C, m: ModelConfig): Adapter => (c.get('test') ? sandbox : adapters[m.adapter]);
   const insufficient = (e: WalletError) =>
-    new HttpError(402, 'insufficient_tokens', `not enough ${config.buckets[e.bucket]?.label || e.bucket}: ${e.balance} left, this call needs ${e.needed}`, {
+    new HttpError(402, 'insufficient_tokens', `your ${config.buckets[e.bucket]?.label || e.bucket} quota is used up for this request; top up in the AICW Store`, {
       bucket: e.bucket,
       balance: e.balance,
       needed: e.needed,
@@ -130,10 +157,16 @@ export function createTokenServer(deps: TokenServerDeps) {
     log('request_failed', { message: e instanceof Error ? e.message : String(e) });
     return new HttpError(502, 'upstream_unavailable', 'the model provider is unavailable; nothing was charged');
   };
-  const withBalance = (res: Response, bucket: string, balance: number | null): Response => {
+  /** The quota of a wallet (never below what it holds, reservations included). */
+  const quotaOf = async (accountRef: string, bucket: string) => {
+    const w = await db.first<{ balance: number; held: number; quota: number }>('SELECT balance,held,quota FROM ts_wallets WHERE account_ref=? AND bucket=?', accountRef, bucket);
+    return w ? Math.max(w.quota ?? 0, w.balance + w.held) : 0;
+  };
+  const withBalance = async (c: C, res: Response, bucket: string, balance: number | null): Promise<Response> => {
     if (balance === null) return res;
     const headers = new Headers(res.headers);
     headers.set(balanceHeader(bucket), String(balance));
+    headers.set(quotaHeader(bucket), String(await quotaOf(c.get('key').account_ref, bucket)));
     return new Response(res.body, { status: res.status, headers });
   };
   const jsonBody = async (c: C): Promise<Record<string, any>> => {
@@ -157,7 +190,7 @@ export function createTokenServer(deps: TokenServerDeps) {
   });
 
   app.get('/healthz', (c) => c.json({ ok: true, name: config.name, protocol: PROTOCOL_VERSION }));
-  app.get(WELL_KNOWN_PATH, (c) => c.json(manifest));
+  app.get(WELL_KNOWN_PATH, async (c) => c.json((await current()).manifest));
 
   // ───────────────────────────── /v1: device key ─────────────────────────────
   app.use('/v1/*', async (c, next) => {
@@ -176,8 +209,8 @@ export function createTokenServer(deps: TokenServerDeps) {
     await next();
   });
 
-  app.get('/v1/models', (c) => {
-    const data = publicModels.map((m) => ({ id: m.id, object: 'model', owned_by: config.providerId, type: m.type, bucket: m.bucket }));
+  app.get('/v1/models', async (c) => {
+    const data = (await current()).models.map((m) => ({ id: m.id, object: 'model', owned_by: config.providerId, type: m.type, bucket: m.bucket }));
     return c.json({ object: 'list', data, models: data });
   });
   app.get('/v1/me/balance', async (c) => {
@@ -185,14 +218,15 @@ export function createTokenServer(deps: TokenServerDeps) {
     for (const id of Object.keys(config.buckets)) {
       b.balances[id] ??= 0;
       b.held[id] ??= 0;
+      b.quota[id] ??= 0;
     }
-    return c.json({ balances: b.balances, held: b.held, buckets: manifest.buckets, updatedAt: b.updatedAt || nowIso() });
+    return c.json({ balances: b.balances, held: b.held, quota: b.quota, buckets: (await current()).buckets, updatedAt: b.updatedAt || nowIso() });
   });
 
   /** Chat Completions and Responses: forward, meter the usage the upstream reports, settle. */
   const chat = (path: '/chat/completions' | '/responses') => async (c: C) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['chat']);
+    const m = await modelOf(body.model, ['chat']);
     const promptChars = JSON.stringify(body.messages ?? body.input ?? '').length + JSON.stringify(body.tools ?? '').length + str(body.instructions, 1_000_000).length;
     const h = await reserve(c, m, holdForChat(m, body, promptChars), 'upTo', path === '/responses' ? 'responses' : 'chat');
     const stream = body.stream === true;
@@ -226,19 +260,19 @@ export function createTokenServer(deps: TokenServerDeps) {
       const charged = usage ? chargeForChat(m, usage) : estimateTokens(promptChars + JSON.stringify(data.choices ?? data.output ?? '').length);
       const balance = await settle(db, h.requestId, charged, data.usage ?? { estimated: true });
       if (data.model) data.model = m.id;
-      return withBalance(Response.json(data), m.bucket, balance);
+      return await withBalance(c, Response.json(data), m.bucket, balance);
     }
     return new Response(meterSse(res.body!, async (seen) => {
       const usage = readChatUsage(seen.usage);
       await settle(db, h.requestId, usage ? chargeForChat(m, usage) : estimateTokens(promptChars + seen.outputChars), seen.usage ?? { estimated: true, aborted: seen.aborted });
-    }), { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', [balanceHeader(m.bucket)]: String(h.balanceAfter) } });
+    }), { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', [balanceHeader(m.bucket)]: String(h.balanceAfter), [quotaHeader(m.bucket)]: String(await quotaOf(c.get('key').account_ref, m.bucket)) } });
   };
   app.post('/v1/chat/completions', chat('/chat/completions'));
   app.post('/v1/responses', chat('/responses'));
 
   app.post('/v1/embeddings', async (c) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['embedding']);
+    const m = await modelOf(body.model, ['embedding']);
     const chars = JSON.stringify(body.input ?? '').length;
     const h = await reserve(c, m, Math.ceil(estimateTokens(chars) * 2 * (m.price?.input ?? 1)), 'upTo', 'embedding');
     return guarded(h.requestId, async () => {
@@ -247,7 +281,7 @@ export function createTokenServer(deps: TokenServerDeps) {
       const data = (await res.json()) as Record<string, any>;
       const total = Number(data?.usage?.total_tokens) || estimateTokens(chars);
       const balance = await settle(db, h.requestId, Math.ceil(total * (m.price?.input ?? 1)), data.usage);
-      return withBalance(Response.json({ ...data, model: m.id }), m.bucket, balance);
+      return await withBalance(c, Response.json({ ...data, model: m.id }), m.bucket, balance);
     });
   });
 
@@ -264,7 +298,7 @@ export function createTokenServer(deps: TokenServerDeps) {
 
   app.post('/v1/images/generations', async (c) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['image']);
+    const m = await modelOf(body.model, ['image']);
     if (!str(body.prompt, 32_000).trim()) throw bad('an image needs a prompt');
     const n = Math.max(1, Math.min(4, Math.trunc(Number(body.n)) || 1));
     const h = await reserve(c, m, tokensForImages(m, str(body.quality, 20), n, false), 'exact', 'image');
@@ -275,13 +309,13 @@ export function createTokenServer(deps: TokenServerDeps) {
       const made = Array.isArray(data?.data) ? data.data.length : 0;
       if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
       const balance = await settle(db, h.requestId, tokensForImages(m, str(body.quality, 20), made, false), { images: made, quality: body.quality ?? 'auto' });
-      return withBalance(Response.json(data), m.bucket, balance);
+      return await withBalance(c, Response.json(data), m.bucket, balance);
     });
   });
   app.post('/v1/images/edits', async (c) => {
     const form = await c.req.formData().catch(() => null);
     if (!form) throw bad('send the edit as multipart/form-data');
-    const m = modelOf(form.get('model'), ['image']);
+    const m = await modelOf(form.get('model'), ['image']);
     if (!str(form.get('prompt'), 32_000).trim()) throw bad('an image edit needs a prompt');
     const n = Math.max(1, Math.min(4, Math.trunc(Number(form.get('n'))) || 1));
     const quality = str(form.get('quality'), 20);
@@ -295,13 +329,13 @@ export function createTokenServer(deps: TokenServerDeps) {
       const made = Array.isArray(data?.data) ? data.data.length : 0;
       if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
       const balance = await settle(db, h.requestId, tokensForImages(m, quality, made, true), { images: made, quality: quality || 'auto', edit: true });
-      return withBalance(Response.json(data), m.bucket, balance);
+      return await withBalance(c, Response.json(data), m.bucket, balance);
     });
   });
 
   app.post('/v1/audio/speech', async (c) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['tts']);
+    const m = await modelOf(body.model, ['tts']);
     const text = str(body.input, 100_000);
     if (!text.trim()) throw bad('speech needs an input text');
     const cost = tokensForSpeech(m, text.length);
@@ -311,13 +345,13 @@ export function createTokenServer(deps: TokenServerDeps) {
       if (!res.ok) throw await upstreamFailure(res);
       const audio = await res.arrayBuffer();
       const balance = await settle(db, h.requestId, cost, { chars: text.length });
-      return withBalance(new Response(audio, { headers: { 'content-type': res.headers.get('content-type') || 'audio/mpeg' } }), m.bucket, balance);
+      return await withBalance(c, new Response(audio, { headers: { 'content-type': res.headers.get('content-type') || 'audio/mpeg' } }), m.bucket, balance);
     });
   });
   app.post('/v1/audio/transcriptions', async (c) => {
     const form = await c.req.formData().catch(() => null);
     if (!form) throw bad('send the audio as multipart/form-data');
-    const m = modelOf(form.get('model'), ['stt']);
+    const m = await modelOf(form.get('model'), ['stt']);
     const cost = tokensPerRequest(m);
     const h = await reserve(c, m, cost, 'exact', 'stt');
     return guarded(h.requestId, async () => {
@@ -326,14 +360,14 @@ export function createTokenServer(deps: TokenServerDeps) {
       if (!res.ok) throw await upstreamFailure(res);
       const text = await res.text();
       const balance = await settle(db, h.requestId, cost, {});
-      return withBalance(new Response(text, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
+      return await withBalance(c, new Response(text, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
     });
   });
 
   /** Any other model type (music, 3D, …): one JSON call, charged per request. */
   app.post('/v1/generate', async (c) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['other']);
+    const m = await modelOf(body.model, ['other']);
     const cost = tokensPerRequest(m);
     const h = await reserve(c, m, cost, 'exact', 'other');
     return guarded(h.requestId, async () => {
@@ -341,7 +375,7 @@ export function createTokenServer(deps: TokenServerDeps) {
       if (!res.ok) throw await upstreamFailure(res);
       const payload = await res.arrayBuffer();
       const balance = await settle(db, h.requestId, cost, {});
-      return withBalance(new Response(payload, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
+      return await withBalance(c, new Response(payload, { headers: { 'content-type': res.headers.get('content-type') || 'application/json' } }), m.bucket, balance);
     });
   });
 
@@ -389,7 +423,7 @@ export function createTokenServer(deps: TokenServerDeps) {
 
   app.post('/v1/videos', async (c) => {
     const body = await jsonBody(c);
-    const m = modelOf(body.model, ['video']);
+    const m = await modelOf(body.model, ['video']);
     const prompt = str(body.prompt, 8000).trim();
     if (!prompt) throw bad('a video needs a prompt');
     const resolution = str(body.resolution, 10) || '720p';
@@ -405,7 +439,7 @@ export function createTokenServer(deps: TokenServerDeps) {
       const made = await video.create({ model: upstreamModel(m), prompt, images, resolution, seconds, ratio: str(body.ratio ?? body.aspect_ratio, 10) || undefined });
       await db.run('UPDATE ts_requests SET upstream_id=?,usage_json=? WHERE id=?', made.id, JSON.stringify({ resolution, seconds }), h.requestId);
       const job: VideoJob = { id: h.requestId, object: 'video', model: m.id, status: 'queued' };
-      return withBalance(Response.json(job), m.bucket, h.balanceAfter);
+      return await withBalance(c, Response.json(job), m.bucket, h.balanceAfter);
     });
   });
   app.get('/v1/videos/:id', async (c) => {
@@ -478,7 +512,7 @@ export function createTokenServer(deps: TokenServerDeps) {
     const deviceRef = ref(body.deviceRef, 'deviceRef');
     await ensureAccount(db, accountRef, body.test === true);
     const issued = await issueKey(db, config.keyPrefix, accountRef, deviceRef);
-    return c.json({ ok: true, key: issued.key, prefix: issued.prefix, provider });
+    return c.json({ ok: true, key: issued.key, prefix: issued.prefix, provider: (await current()).provider });
   });
   app.post('/aicw/keys/revoke', async (c) => {
     const body = await signed<KeyRevokeRequest>(c);
@@ -491,10 +525,11 @@ export function createTokenServer(deps: TokenServerDeps) {
     for (const id of Object.keys(config.buckets)) {
       b.balances[id] ??= 0;
       b.held[id] ??= 0;
+      b.quota[id] ??= 0;
     }
     const keys = (await listKeys(db, accountRef)).map((k) => ({ prefix: k.prefix, deviceRef: k.device_ref, status: k.status, createdAt: k.created_at, lastUsedAt: k.last_used_at }));
     const usage = await usageSummary(db, accountRef, new Date(Date.now() - 30 * 86_400_000).toISOString());
-    return c.json({ ok: true, balances: b.balances, held: b.held, keys, usage });
+    return c.json({ ok: true, balances: b.balances, held: b.held, quota: b.quota, buckets: (await current()).buckets, keys, usage });
   });
   app.post('/aicw/adjust', async (c) => {
     const body = await signed<AdjustRequest>(c);
@@ -503,6 +538,52 @@ export function createTokenServer(deps: TokenServerDeps) {
     if (!Number.isInteger(body.delta) || body.delta === 0 || Math.abs(body.delta) > 1e12) throw bad('delta must be a non-zero whole number');
     const applied = await adjust(db, { accountRef: ref(body.accountRef, 'accountRef'), bucket: body.bucket, delta: body.delta, ref: ref(body.ref, 'ref'), note: str(body.note, 300) || undefined });
     return c.json({ ok: true, applied, balances: (await balances(db, body.accountRef)).balances });
+  });
+
+  // Prices and estimates: read by any trusted Store, changed only when the operator allows it.
+  app.post('/aicw/prices', async (c) => {
+    await signed(c);
+    // Read straight from the database: the page shows what the next call will be charged.
+    const o = config.allowStorePricing ? await readOverrides(db) : { prices: new Map(), estimates: new Map() };
+    const catalog = liveCatalog(config, o);
+    const body: PricesResponse = {
+      ok: true,
+      editable: !!config.allowStorePricing,
+      models: catalog.models.map((m, i) => ({ id: m.id, type: m.type, bucket: m.bucket, price: fullPrice(m) as Record<string, unknown>, defaultPrice: fullPrice(config.models[i]) as Record<string, unknown>, overridden: o.prices.has(m.id), ...(m.unit ? { unit: m.unit } : {}), updatedAt: o.prices.get(m.id)?.updatedAt ?? null })),
+      buckets: Object.entries(config.buckets).filter(([id]) => catalog.estimates[id]).map(([id, b]) => ({ bucket: id, label: b.label, estimate: catalog.estimates[id], profile: catalog.profiles[id] as unknown as Record<string, unknown>, overridden: o.estimates.has(id), updatedAt: o.estimates.get(id)?.updatedAt ?? null })),
+      log: config.allowStorePricing ? await overrideLog(db) : [],
+    };
+    return c.json(body);
+  });
+  const pricingAllowed = () => {
+    if (!config.allowStorePricing) throw new HttpError(403, 'pricing_disabled', 'this server keeps its prices in its configuration file');
+  };
+  app.post('/aicw/prices/set', async (c) => {
+    const body = await signed<SetPriceRequest>(c);
+    pricingAllowed();
+    const model = config.models.find((m) => m.id === body.model);
+    if (!model) throw new HttpError(404, 'model_not_found', `this server has no model "${str(body.model, 200)}"`);
+    if (body.price !== null) {
+      const problems = checkPrice(model, body.price);
+      if (problems.length) throw bad(problems.join('; '), 'invalid_price');
+    }
+    await writeOverride(db, 'price', model.id, body.price, str(body.note, 300) || null);
+    live = null;
+    log('price_set', { model: model.id, reset: body.price === null });
+    return c.json({ ok: true, manifest: (await current()).manifest });
+  });
+  app.post('/aicw/estimates/set', async (c) => {
+    const body = await signed<SetEstimateRequest>(c);
+    pricingAllowed();
+    if (!config.buckets[body.bucket]) throw bad(`this server has no bucket "${str(body.bucket, 80)}"`, 'unknown_bucket');
+    if (body.estimate !== null) {
+      const problems = checkEstimate(config, body.bucket, body.estimate);
+      if (problems.length) throw bad(problems.join('; '), 'invalid_estimate');
+    }
+    await writeOverride(db, 'estimate', body.bucket, body.estimate, str(body.note, 300) || null);
+    live = null;
+    log('estimate_set', { bucket: body.bucket, reset: body.estimate === null });
+    return c.json({ ok: true, manifest: (await current()).manifest });
   });
 
   /**
@@ -532,7 +613,9 @@ export function createTokenServer(deps: TokenServerDeps) {
     return { videos, released };
   }
 
-  return { app, fetch: app.fetch, manifest, provider, sweep };
+  /** The manifest as it is now (prices and estimates the Store set included). */
+  const currentManifest = async () => (await current()).manifest;
+  return { app, fetch: app.fetch, manifest, provider, currentManifest, sweep };
 }
 
 /**

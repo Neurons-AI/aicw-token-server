@@ -44,6 +44,18 @@ export interface ModelConfig {
   /** One sentence for buyers. */
   unit?: string;
 }
+/** A wallet bucket. */
+export interface BucketConfig {
+  label: string;
+  /** Store deep link where a buyer gets more of this bucket. */
+  topup?: string;
+  /**
+   * What one typical use looks like, for the "about how many" a buyer sees instead of a token
+   * count (default: the bucket's first model; an agent message of 6,000 fresh input + 60,000
+   * cached input + 2,000 output tokens; a medium image; a 5 second 720p video).
+   */
+  estimate?: import('./prices.ts').EstimateProfile;
+}
 export interface TokenServerConfig {
   name: string;
   /** How the app files this server: lowercase letters, digits, dashes. */
@@ -54,11 +66,16 @@ export interface TokenServerConfig {
   publicUrl: string;
   /** Raw Ed25519 public keys (base64) of the Stores allowed to grant tokens and issue keys. */
   trustedStoreKeys: string[];
-  buckets: Record<string, { label: string; topup?: string }>;
+  buckets: Record<string, BucketConfig>;
   models: ModelConfig[];
   adapters: Record<string, AdapterConfig>;
   /** Whether a trusted Store may also correct balances by hand (`/aicw/adjust`). */
   allowStoreAdjust?: boolean;
+  /**
+   * Whether a trusted Store may change prices and estimates at run time (`/aicw/prices/set`,
+   * `/aicw/estimates/set`). Off by default: the prices in this file are the prices.
+   */
+  allowStorePricing?: boolean;
   limits?: { requestsPerMinute?: number; maxOpenVideos?: number; maxBodyBytes?: number };
 }
 

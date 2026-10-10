@@ -27,6 +27,25 @@ export interface PublicModel {
   /** One sentence a buyer can read: "1 token = 1 image at medium quality". */
   unit?: string;
 }
+/** What one typical use of a bucket is: a buyer sees "about N <unit>s", never a token count. */
+export type EstimateUnit = 'message' | 'image' | 'video' | 'speech' | 'request';
+export interface BucketEstimate {
+  unit: EstimateUnit;
+  /** The model a typical use goes to. */
+  model: string;
+  /** Wallet tokens one typical use costs (may be fractional). */
+  each: number;
+  /** video: the clip the estimate counts. */
+  seconds?: number;
+  resolution?: string;
+  /** image: the quality the estimate counts. */
+  quality?: string;
+}
+export interface PublicBucket {
+  id: string;
+  label: string;
+  estimate?: BucketEstimate;
+}
 export interface ServerManifest {
   protocol: number;
   name: string;
@@ -34,7 +53,7 @@ export interface ServerManifest {
   providerId: string;
   /** Base URL of the OpenAI-compatible API, ending in /v1. */
   baseUrl: string;
-  buckets: Array<{ id: string; label: string }>;
+  buckets: PublicBucket[];
   models: PublicModel[];
   library?: { name: string; version: string };
 }
@@ -104,6 +123,9 @@ export interface BalanceResponse {
   ok: true;
   balances: Record<string, number>;
   held: Record<string, number>;
+  /** Per bucket: the wallet right after its last top-up. 100% of the buyer's quota; balance / quota is what is left. */
+  quota: Record<string, number>;
+  buckets: PublicBucket[];
   keys: Array<{ prefix: string; deviceRef: string | null; status: string; createdAt: string; lastUsedAt: string | null }>;
   usage: Array<{ bucket: string; model: string; requests: number; charged: number }>;
 }
@@ -116,11 +138,54 @@ export interface AdjustRequest extends Signed {
   note?: string;
 }
 
+/** `POST /aicw/prices`: what the Store's price page shows. */
+export interface PriceEntry {
+  id: string;
+  type: ModelType;
+  bucket: string;
+  /** The price in force (the operator's, or the Store's replacement). */
+  price: Record<string, unknown>;
+  /** The operator's price from the configuration file. */
+  defaultPrice: Record<string, unknown>;
+  overridden: boolean;
+  unit?: string;
+  updatedAt: string | null;
+}
+export interface EstimateEntry {
+  bucket: string;
+  label: string;
+  estimate: BucketEstimate;
+  /** The typical use in force, every default filled in. */
+  profile: Record<string, unknown>;
+  overridden: boolean;
+  updatedAt: string | null;
+}
+export interface PricesResponse {
+  ok: true;
+  /** False: this server keeps its prices in its configuration file and refuses changes. */
+  editable: boolean;
+  models: PriceEntry[];
+  buckets: EstimateEntry[];
+  log: Array<{ kind: string; target: string; value: unknown; note: string | null; at: string }>;
+}
+export interface SetPriceRequest extends Signed {
+  model: string;
+  /** Fields of the price to replace (tables merge key by key); null puts the operator's price back. */
+  price: Record<string, unknown> | null;
+  note?: string;
+}
+export interface SetEstimateRequest extends Signed {
+  bucket: string;
+  estimate: Record<string, unknown> | null;
+  note?: string;
+}
+
 /** `GET /v1/me/balance` (device key). */
 export interface MeBalance {
   balances: Record<string, number>;
   held: Record<string, number>;
-  buckets: Array<{ id: string; label: string }>;
+  quota: Record<string, number>;
+  buckets: PublicBucket[];
   updatedAt: string;
 }
 /** The error body of every `/v1/*` failure (the OpenAI shape, plus what the app needs to react). */
@@ -137,6 +202,8 @@ export interface ApiError {
   };
 }
 export const balanceHeader = (bucket: string) => `x-aicw-balance-${bucket.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+/** The bucket's quota (100% = the wallet right after its last top-up), next to its balance: apps show balance ÷ quota, not tokens. */
+export const quotaHeader = (bucket: string) => `x-aicw-quota-${bucket.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
 
 /** Video job states, the same words the OpenAI video API uses. */
 export type VideoStatus = 'queued' | 'in_progress' | 'completed' | 'failed';

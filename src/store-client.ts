@@ -13,6 +13,7 @@ import {
   type FulfillRequest,
   type FulfillResponse,
   type KeyResponse,
+  type PricesResponse,
   type RefundResponse,
   type ServerManifest,
 } from './protocol.ts';
@@ -39,6 +40,11 @@ export interface StoreClient {
   revokeKeys(accountRef: string, deviceRef?: string): Promise<{ ok: true; revoked: number }>;
   balance(accountRef: string): Promise<BalanceResponse>;
   adjust(req: Omit2<AdjustRequest>): Promise<FulfillResponse>;
+  /** Live prices and estimates (any trusted Store may read them). */
+  prices(): Promise<PricesResponse>;
+  /** Replace a model's price (fields merge over the operator's); null restores it. Needs `allowStorePricing`. */
+  setPrice(model: string, price: Record<string, unknown> | null, note?: string): Promise<{ ok: true; manifest: ServerManifest }>;
+  setEstimate(bucket: string, estimate: Record<string, unknown> | null, note?: string): Promise<{ ok: true; manifest: ServerManifest }>;
 }
 export function storeClient(serverUrl: string, signer: Signer, fetchImpl: typeof fetch = fetch, timeoutMs = 20_000): StoreClient {
   const base = serverUrl.replace(/\/+$/, '');
@@ -59,5 +65,8 @@ export function storeClient(serverUrl: string, signer: Signer, fetchImpl: typeof
     revokeKeys: (accountRef, deviceRef) => post('/aicw/keys/revoke', { accountRef, ...(deviceRef ? { deviceRef } : {}) }),
     balance: (accountRef) => post('/aicw/balance', { accountRef }),
     adjust: (req) => post('/aicw/adjust', req as unknown as Record<string, unknown>),
+    prices: () => post('/aicw/prices', {}),
+    setPrice: (model, price, note) => post('/aicw/prices/set', { model, price, ...(note ? { note } : {}) }),
+    setEstimate: (bucket, estimate, note) => post('/aicw/estimates/set', { bucket, estimate, ...(note ? { note } : {}) }),
   };
 }

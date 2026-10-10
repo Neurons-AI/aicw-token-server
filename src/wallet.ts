@@ -35,15 +35,16 @@ export async function ensureAccount(db: Storage, accountRef: string, test = fals
 export async function isTestAccount(db: Storage, accountRef: string): Promise<boolean> {
   return !!(await db.first<{ test: number }>('SELECT test FROM ts_accounts WHERE ref=?', accountRef))?.test;
 }
-export async function balances(db: Storage, accountRef: string): Promise<{ balances: Record<string, number>; held: Record<string, number>; updatedAt: string }> {
-  const rows = await db.all<{ bucket: string; balance: number; held: number; updated_at: string }>(
-    'SELECT bucket,balance,held,updated_at FROM ts_wallets WHERE account_ref=?',
+export async function balances(db: Storage, accountRef: string): Promise<{ balances: Record<string, number>; held: Record<string, number>; quota: Record<string, number>; updatedAt: string }> {
+  const rows = await db.all<{ bucket: string; balance: number; held: number; quota: number; updated_at: string }>(
+    'SELECT bucket,balance,held,quota,updated_at FROM ts_wallets WHERE account_ref=?',
     accountRef
   );
-  const out = { balances: {} as Record<string, number>, held: {} as Record<string, number>, updatedAt: '' };
+  const out = { balances: {} as Record<string, number>, held: {} as Record<string, number>, quota: {} as Record<string, number>, updatedAt: '' };
   for (const r of rows) {
     out.balances[r.bucket] = r.balance;
     out.held[r.bucket] = r.held;
+    out.quota[r.bucket] = Math.max(r.quota ?? 0, r.balance + r.held);
     if (r.updated_at > out.updatedAt) out.updatedAt = r.updated_at;
   }
   return out;
@@ -70,9 +71,11 @@ export async function grantReceipt(
     batch.push(
       st('INSERT INTO ts_ledger(id,account_ref,bucket,delta,kind,ref,note,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId(), p.accountRef, g.bucket, g.amount, 'grant', p.receiptId, p.sku, stamp),
       st(
-        'INSERT INTO ts_wallets(account_ref,bucket,balance,held,updated_at) VALUES(?,?,?,0,?) ON CONFLICT(account_ref,bucket) DO UPDATE SET balance=balance+excluded.balance,updated_at=excluded.updated_at',
+        // A top-up starts a new 100%: the quota is the wallet right after it.
+        'INSERT INTO ts_wallets(account_ref,bucket,balance,held,quota,updated_at) VALUES(?,?,?,0,?,?) ON CONFLICT(account_ref,bucket) DO UPDATE SET balance=balance+excluded.balance,quota=balance+held+excluded.balance,updated_at=excluded.updated_at',
         p.accountRef,
         g.bucket,
+        g.amount,
         g.amount,
         stamp
       )
@@ -115,7 +118,8 @@ export async function refundReceipt(db: Storage, receiptId: string): Promise<{ a
         g.bucket,
         receiptId
       ),
-      st(`UPDATE ts_wallets SET balance=balance-MIN(?,MAX(balance,0)),updated_at=? WHERE account_ref=? AND bucket=? AND ${pending}`, g.amount, stamp, receipt.account_ref, g.bucket, receiptId)
+      // What was taken back leaves the quota too (never below what is still in the wallet).
+      st(`UPDATE ts_wallets SET balance=balance-MIN(?,MAX(balance,0)),quota=MAX(balance-MIN(?,MAX(balance,0))+held,quota-MIN(?,MAX(balance,0))),updated_at=? WHERE account_ref=? AND bucket=? AND ${pending}`, g.amount, g.amount, g.amount, stamp, receipt.account_ref, g.bucket, receiptId)
     );
   }
   batch.push(st('UPDATE ts_receipts SET refunded_at=? WHERE receipt_id=? AND refunded_at IS NULL', stamp, receiptId));
@@ -132,10 +136,12 @@ export async function adjust(db: Storage, p: { accountRef: string; bucket: strin
       st('INSERT OR IGNORE INTO ts_accounts(ref,test,created_at) VALUES(?,0,?)', p.accountRef, stamp),
       st('INSERT INTO ts_ledger(id,account_ref,bucket,delta,kind,ref,note,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId(), p.accountRef, p.bucket, p.delta, 'adjust', p.ref, p.note ?? null, stamp),
       st(
-        'INSERT INTO ts_wallets(account_ref,bucket,balance,held,updated_at) VALUES(?,?,?,0,?) ON CONFLICT(account_ref,bucket) DO UPDATE SET balance=balance+excluded.balance,updated_at=excluded.updated_at',
+        // A correction upward can only raise the quota to what the wallet now holds.
+        'INSERT INTO ts_wallets(account_ref,bucket,balance,held,quota,updated_at) VALUES(?,?,?,0,?,?) ON CONFLICT(account_ref,bucket) DO UPDATE SET balance=balance+excluded.balance,quota=MAX(quota,balance+held+excluded.balance),updated_at=excluded.updated_at',
         p.accountRef,
         p.bucket,
         p.delta,
+        Math.max(p.delta, 0),
         stamp
       ),
     ]);
