@@ -10,5 +10,6 @@ export * from './adapters/index.ts';
 export { mockAdapter } from './adapters/mock.ts';
 export { openaiAdapter } from './adapters/openai.ts';
 export { byteplusAdapter } from './adapters/byteplus.ts';
+export { elevenlabsAdapter } from './adapters/elevenlabs.ts';
 export { createTokenServer, meterSse, LIBRARY, type TokenServerDeps } from './server.ts';
 export { signedRequest, storeClient, TokenServerError, type StoreClient } from './store-client.ts';

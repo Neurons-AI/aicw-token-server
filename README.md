@@ -12,24 +12,53 @@ AI Coworker app ── Bearer sk-yourprefix-… (one key per device) ──▶ y
 
 ## Quick start (10 minutes)
 
-> Until the package is published on npm / GitHub (`Neurons-AI/aicw-token-server`), run it from this folder: `pnpm install && node src/cli.ts <command>`.
+> Not on npm yet: run it from a clone (`git clone https://github.com/Neurons-AI/aicw-token-server ~/aicw-token-server && cd ~/aicw-token-server && pnpm install`) as `node src/cli.ts <command>`. Node 22.18 or newer (it runs the TypeScript sources directly).
+>
+> Not technical? Ask the agent in AI Coworker: "sell tokens for my app with my own server". It does
+> every step below; you only log in to Cloudflare once and click "Allow" in the app.
 
 ```bash
-npm i -g aicw-token-server            # Node 22.5 or newer
 mkdir my-tokens && cd my-tokens
-aicw-token-server init                # writes token-server.json + .env.example
-# edit token-server.json (name, providerId, publicUrl, buckets, models) and put your keys in .env
-aicw-token-server check --self        # runs the full conformance check in memory, costs nothing
-set -a; . ./.env; set +a
-aicw-token-server start --port 8787   # SQLite file token-server.db next to it
+node ~/aicw-token-server/src/cli.ts init                # token-server.json + .env.example
+# edit token-server.json (name, providerId, buckets, models, prices) and put your keys in .env
+node ~/aicw-token-server/src/cli.ts check --self        # the full conformance check in memory, costs nothing
+node ~/aicw-token-server/src/cli.ts deploy cloudflare   # online in a minute, see "Deploy"
 ```
 
-Put it behind HTTPS (Caddy, nginx, Cloudflare Tunnel) at the `publicUrl` you configured, then in
-the AICW Store: **Developer → AI Token servers → Add and check**. The Store runs the same
-conformance check against your URL (again every week; three failed weeks in a row stop your packs
-from selling). Then create **Token packs** that grant tokens from your buckets.
+Then in the AICW Store: **Developer → AI Token servers → Add and check** with the address it printed.
+The Store runs the same conformance check against your URL (again every week; three failed weeks in
+a row stop your packs from selling). Then create **Token packs** that grant tokens from your buckets.
 
-Docker: `docker build -t aicw-token-server .` then `docker run -v $PWD:/data --env-file .env -p 8787:8787 aicw-token-server` (the folder holds `token-server.json` and the SQLite wallets).
+## Deploy
+
+### Cloudflare (recommended: one command, free plan is enough to start)
+
+```bash
+node ~/aicw-token-server/src/cli.ts deploy cloudflare [--name my-tokens] [--account-id <id>]
+```
+
+It logs you in to Cloudflare (a browser window, once), creates a D1 database for the wallets, deploys
+a Worker named `aicw-tokens-<providerId>`, stores every key your adapters name (`apiKeyEnv`, read
+from `.env`) as Worker secrets, writes the `https://….workers.dev` address into `publicUrl`, and
+checks that it answers. Run it again after changing prices, models or keys. It writes
+`.aicw-deploy/` next to your config (keep it out of git with `.env`). The tables are created on the
+first request, so there is no migration step; D1 keeps a point-in-time history of the wallets
+(7 days on the free plan, 30 on a paid one). The Worker entry is `src/worker.ts`
+(`export default createWorker(config)`) if you prefer your own wrangler setup.
+
+### Your own machine or VPS (Docker or Node)
+
+```bash
+node ~/aicw-token-server/src/cli.ts start --port 8787     # SQLite file token-server.db next to it
+# or: docker build -t aicw-token-server . && docker run -v $PWD:/data --env-file .env -p 8787:8787 aicw-token-server
+```
+
+The Store only talks to `https://`. Put it behind HTTPS at your `publicUrl`:
+- **Caddy** (automatic certificates): `tokens.example.com { reverse_proxy 127.0.0.1:8787 }`
+- **Cloudflare Tunnel** (no open port): `cloudflared tunnel --url http://127.0.0.1:8787`, then a named tunnel for a fixed hostname.
+
+Back up `token-server.db` daily (it is your customers' wallets) and keep the process running
+(systemd, `docker run --restart=always`).
 
 ## token-server.json
 
@@ -41,7 +70,7 @@ Docker: `docker build -t aicw-token-server .` then `docker run -v $PWD:/data --e
 | `publicUrl` | The public `https://` address, without `/v1`. |
 | `trustedStoreKeys` | Ed25519 public keys of the Store (the sample already has the AICW Store key). |
 | `buckets` | Your wallets: `{ "voice_tokens": { "label": "voice tokens", "topup": "aicoworker://store/skills/<your pack>", "estimate": { … } } }`. `estimate` (optional) is one typical use, see below. |
-| `adapters` | Where calls go: `openai` (any OpenAI-compatible API: `baseUrl` + `apiKeyEnv`), `byteplus` (Seedance video), `mock` (canned answers for testing). |
+| `adapters` | Where calls go: `openai` (any OpenAI-compatible API: `baseUrl` + `apiKeyEnv`), `byteplus` (Seedance video), `elevenlabs` (ElevenLabs speech: `apiKeyEnv`, `voice` = default voice id; the model's `upstreamModel` is their model id), `mock` (canned answers for testing). |
 | `models` | `{ id, type, bucket, adapter, upstreamModel?, price?, unit? }`. `type` is `chat`, `image`, `video`, `tts`, `stt`, `embedding` or `other`. |
 | `allowStoreAdjust` | Let the Store's administrators correct balances by hand (off by default). |
 | `allowStorePricing` | Let a trusted Store change prices and estimates at run time (off by default; see below). |
@@ -127,8 +156,7 @@ test Store key and start your server trusting it.
 ## Housekeeping
 
 `start` sweeps every minute: finishes video jobs nobody polled, frees reservations of calls that
-died. On Cloudflare Workers run `server.sweep()` from a cron (see `../cloud`, the Neurons AI Cloud
-deployment: the same library on D1).
+died. On Cloudflare the deployed Worker runs the sweep from a 5-minute cron (`createWorker` does it).
 
 ## Security checklist
 
@@ -136,5 +164,6 @@ deployment: the same library on D1).
 - HTTPS only (the Store refuses `http://`).
 - Back up the SQLite file: it is your customers' wallets.
 - Keep `AICW_EXTRA_STORE_KEYS` empty in production (it is for local checks).
-- Upgrading from 0.1 needs no step on Node (the schema upgrades itself on start); on D1 apply the
-  new migration (`../cloud/scripts/write-migration.mjs` writes one file per schema version).
+- Upgrading needs no step: the schema upgrades itself on start (Node) or on the first request
+  (`deploy cloudflare` / `createWorker`). Your own D1 setup with wrangler migrations instead: the
+  statements are `SCHEMA` then `upgradeSql(u)` for each of `UPGRADES` in `src/storage.ts`.

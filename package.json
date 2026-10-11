@@ -1,6 +1,6 @@
 {
   "name": "aicw-token-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Self-hosted AI Token API server for AI Coworker: per-device keys, prepaid token wallets, OpenAI-compatible endpoints, AICW Store fulfilment.",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,9 @@
     "./check": "./src/check/suite.ts",
     "./protocol": "./src/protocol.ts",
     "./d1": "./src/storage-d1.ts",
-    "./node": "./src/node.ts"
+    "./node": "./src/node.ts",
+    "./worker": "./src/worker.ts",
+    "./deploy": "./src/deploy.ts"
   },
   "files": [
     "dist",
@@ -23,7 +25,7 @@
     "Dockerfile"
   ],
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.18"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

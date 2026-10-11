@@ -5,12 +5,14 @@
 import { MODEL_TYPES, type ModelType } from './protocol.ts';
 
 export interface AdapterConfig {
-  /** `openai`: any OpenAI-compatible API. `byteplus`: BytePlus ModelArk video (Seedance). `mock`: canned answers. */
-  kind: 'openai' | 'byteplus' | 'mock' | (string & {});
+  /** `openai`: any OpenAI-compatible API. `byteplus`: BytePlus ModelArk video (Seedance). `elevenlabs`: ElevenLabs speech. `mock`: canned answers. */
+  kind: 'openai' | 'byteplus' | 'elevenlabs' | 'mock' | (string & {});
   baseUrl?: string;
   /** Name of the environment variable with the upstream API key. */
   apiKeyEnv?: string;
   headers?: Record<string, string>;
+  /** elevenlabs: the voice id used when a request names none. */
+  voice?: string;
 }
 /** How many wallet tokens one call costs. */
 export interface Price {
@@ -99,7 +101,7 @@ export function validateConfig(raw: unknown, extraAdapterKinds: string[] = []): 
   const adapters = c.adapters && typeof c.adapters === 'object' ? c.adapters : {};
   for (const [id, a] of Object.entries(adapters)) {
     const kind = (a as AdapterConfig)?.kind;
-    if (!['openai', 'byteplus', 'mock', ...extraAdapterKinds].includes(kind)) problems.push(`adapters.${id}.kind: openai, byteplus, mock${extraAdapterKinds.length ? ', ' + extraAdapterKinds.join(', ') : ''}`);
+    if (!['openai', 'byteplus', 'elevenlabs', 'mock', ...extraAdapterKinds].includes(kind)) problems.push(`adapters.${id}.kind: openai, byteplus, elevenlabs, mock${extraAdapterKinds.length ? ', ' + extraAdapterKinds.join(', ') : ''}`);
     if (kind === 'openai' && !str((a as AdapterConfig)?.baseUrl)) problems.push(`adapters.${id}.baseUrl: the upstream API address`);
   }
   const seen = new Set<string>();

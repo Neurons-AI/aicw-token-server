@@ -5,6 +5,8 @@
  *   aicw-token-server check <url> --key <file>      run the conformance check against a server
  *   aicw-token-server check --self [--config f]     start this config in memory and check it
  *   aicw-token-server keygen               make a test Store key pair for local checks
+ *   aicw-token-server deploy cloudflare [--config f] [--env f] [--name n] [--account-id id]
+ *                                          put the server online on your Cloudflare account (Workers + D1)
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -13,6 +15,8 @@ import { AICW_STORE_PUBLIC_KEYS, validateConfig } from './config.ts';
 import { generateSigner, signerFromPkcs8 } from './crypto.ts';
 import { loadConfigFile, startNodeServer } from './node.ts';
 import { createTokenServer } from './server.ts';
+import { spawn } from 'node:child_process';
+import { deployCloudflare, DeployError, type WranglerRunner } from './deploy.ts';
 import { migrate } from './storage.ts';
 import { sqliteStorage } from './storage-sqlite.ts';
 
@@ -99,7 +103,37 @@ async function main(): Promise<number> {
     console.log(has('json') ? JSON.stringify(report, null, 2) : formatReport(report));
     return report.ok ? 0 : 1;
   }
-  console.log('usage: aicw-token-server <init | start | check | keygen>\n  init                      write token-server.json + .env.example\n  start [--port n] [--db f]  run the server\n  check --self              check this config in memory (no network, no upstream cost)\n  check <url> --key <file>  check a running server\n  keygen                    make a test Store key for local checks');
+  if (command === 'deploy') {
+    if (args[1] !== 'cloudflare') {
+      console.error('usage: aicw-token-server deploy cloudflare [--config token-server.json] [--env .env] [--name n] [--account-id id]');
+      return 1;
+    }
+    const accountId = flag('account-id') ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+    // wrangler 4 through npx: nothing to install by hand.
+    const wrangler: WranglerRunner = (wargs, opts) =>
+      new Promise((done) => {
+        const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--yes', 'wrangler@4', ...wargs], {
+          cwd: opts.cwd,
+          env: { ...process.env, ...(accountId ? { CLOUDFLARE_ACCOUNT_ID: accountId } : {}), WRANGLER_SEND_METRICS: 'false' },
+          stdio: opts.interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'],
+          shell: process.platform === 'win32',
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout?.on('data', (b) => (stdout += b));
+        child.stderr?.on('data', (b) => (stderr += b));
+        child.on('close', (code) => done({ code: code ?? 1, stdout, stderr }));
+        child.on('error', (e) => done({ code: 1, stdout, stderr: String(e) }));
+      });
+    try {
+      await deployCloudflare({ configPath: configPath(), envPath: flag('env'), name: flag('name'), accountId, testStoreKey: flag('test-store-key'), wrangler });
+      return 0;
+    } catch (e) {
+      console.error(e instanceof DeployError ? `\n${e.message}` : e);
+      return 1;
+    }
+  }
+  console.log('usage: aicw-token-server <init | start | check | keygen | deploy cloudflare>\n  init                      write token-server.json + .env.example\n  start [--port n] [--db f]  run the server\n  check --self              check this config in memory (no network, no upstream cost)\n  check <url> --key <file>  check a running server\n  keygen                    make a test Store key for local checks\n  deploy cloudflare         put it online on your Cloudflare account (Workers + D1, one command)');
   return command ? 1 : 0;
 }
 main().then(
