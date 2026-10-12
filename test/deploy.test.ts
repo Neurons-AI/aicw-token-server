@@ -1,9 +1,9 @@
-/** `deploy cloudflare` with a stand-in wrangler: the steps, the files it writes, the secrets, publicUrl. */
+/** `deploy cloudflare` with a stand-in `cf`: the steps, the files it writes, the secrets, publicUrl. */
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { deployCloudflare, readEnvFile, type WranglerRunner } from '../src/deploy.ts';
+import { deployCloudflare, readEnvFile, type Runner } from '../src/deploy.ts';
 import { sampleConfig } from './helpers.ts';
 
 function project(over: Record<string, unknown> = {}, env = 'OPENAI_API_KEY=sk-test-123\n') {
@@ -13,56 +13,61 @@ function project(over: Record<string, unknown> = {}, env = 'OPENAI_API_KEY=sk-te
   if (env) writeFileSync(join(dir, '.env'), env);
   return dir;
 }
-function fakeWrangler(opts: { loggedIn?: boolean; existingDb?: boolean } = {}) {
-  const calls: Array<{ args: string[]; interactive?: boolean; secrets?: unknown; files?: Record<string, string> }> = [];
+function fakeCf(opts: { loggedIn?: boolean; existingDb?: boolean } = {}) {
+  const calls: Array<{ tool: string; args: string[]; interactive?: boolean; secrets?: unknown; config?: string; worker?: string; pkg?: string }> = [];
   let loggedIn = opts.loggedIn ?? true;
-  const run: WranglerRunner = async (args, { cwd, interactive }) => {
-    const call: (typeof calls)[number] = { args, interactive };
+  const run: Runner = async (tool, args, { cwd, interactive }) => {
+    const call: (typeof calls)[number] = { tool, args, interactive };
     calls.push(call);
-    if (args[0] === 'whoami') return loggedIn ? { code: 0, stdout: 'You are logged in with an OAuth Token', stderr: 'WARNING Wrangler is missing some expected Oauth scopes. To fix this, run `wrangler login`' } : { code: 1, stdout: '', stderr: 'You are not authenticated. Please run `wrangler login`.' };
-    if (args[0] === 'login') { loggedIn = true; return { code: 0, stdout: 'Successfully logged in.', stderr: '' }; }
-    if (args[0] === 'd1' && args[1] === 'create') return opts.existingDb ? { code: 1, stdout: '', stderr: 'A database with that name already exists' } : { code: 0, stdout: '{\n "d1_databases": [{ "binding": "DB", "database_name": "x", "database_id": "11111111-2222-3333-4444-555555555555" }]\n}', stderr: '' };
-    if (args[0] === 'd1' && args[1] === 'list') return { code: 0, stdout: JSON.stringify([{ name: 'aicw-tokens-test-tokens', uuid: '99999999-2222-3333-4444-555555555555' }]), stderr: '' };
-    if (args[0] === 'deploy') { call.files = { toml: readFileSync(join(cwd, 'wrangler.toml'), 'utf8'), worker: readFileSync(join(cwd, 'worker.ts'), 'utf8') }; return { code: 0, stdout: 'Uploaded aicw-tokens-test-tokens\nDeployed aicw-tokens-test-tokens triggers\n  https://aicw-tokens-test-tokens.acme.workers.dev\n', stderr: '' }; }
-    if (args[0] === 'secret') { call.secrets = JSON.parse(readFileSync(args[2], 'utf8')); return { code: 0, stdout: 'Finished processing secrets', stderr: '' }; }
-    return { code: 1, stdout: '', stderr: 'unexpected ' + args.join(' ') };
+    if (tool === 'npm') { call.pkg = readFileSync(join(cwd, 'package.json'), 'utf8'); return { code: 0, stdout: '', stderr: '' }; }
+    const a = args.join(' ');
+    if (a === 'auth whoami') return { code: 0, stdout: JSON.stringify({ authenticated: loggedIn, tokenValid: loggedIn }), stderr: '' };
+    if (a === 'auth login') { loggedIn = true; return { code: 0, stdout: 'Successfully logged in', stderr: '' }; }
+    if (a === 'd1 list') return { code: 0, stdout: JSON.stringify(opts.existingDb ? [{ name: 'aicw-tokens-test-tokens', uuid: '99999999-2222-3333-4444-555555555555' }] : []), stderr: '' };
+    if (a.startsWith('d1 create')) return { code: 0, stdout: JSON.stringify({ uuid: '11111111-2222-3333-4444-555555555555', name: args[3] }), stderr: '' };
+    if (a === 'deploy --mode production') { call.config = readFileSync(join(cwd, 'cloudflare.config.ts'), 'utf8'); call.worker = readFileSync(join(cwd, 'worker.ts'), 'utf8'); return { code: 0, stdout: '│  Deployed aicw-tokens-test-tokens triggers\n│    https://aicw-tokens-test-tokens.acme.workers.dev\n◆  Deploy complete', stderr: '' }; }
+    if (a.startsWith('workers secrets bulk')) { const body = JSON.parse(readFileSync(args[args.indexOf('--file') + 1], 'utf8')); call.secrets = body; return { code: 0, stdout: JSON.stringify(Object.fromEntries(Object.keys(body.secrets).map((k) => [k, { name: k, type: 'secret_text' }]))), stderr: '' }; }
+    return { code: 1, stdout: '', stderr: 'unexpected ' + a };
   };
   return { run, calls };
 }
 const answering = (async () => Response.json({ providerId: 'test-tokens', protocol: 1 })) as unknown as typeof fetch;
 
-describe('deploy cloudflare', () => {
-  it('logs in when needed, creates the database, deploys, writes the real address back, then sets the keys as secrets', async () => {
+describe('deploy cloudflare (cf)', () => {
+  it('installs cf, logs in when needed, creates the database, deploys, writes the real address back, sets the keys as secrets', async () => {
     const dir = project();
-    const w = fakeWrangler({ loggedIn: false });
+    const w = fakeCf({ loggedIn: false });
     const lines: string[] = [];
-    const r = await deployCloudflare({ configPath: join(dir, 'token-server.json'), wrangler: w.run, fetch: answering, log: (l) => lines.push(l) });
+    const r = await deployCloudflare({ configPath: join(dir, 'token-server.json'), run: w.run, fetch: answering, log: (l) => lines.push(l) });
     expect(r).toEqual({ url: 'https://aicw-tokens-test-tokens.acme.workers.dev', name: 'aicw-tokens-test-tokens', databaseId: '11111111-2222-3333-4444-555555555555' });
-    expect(w.calls.map((c) => c.args[0] + (c.args[1] && !c.args[1].startsWith('/') ? ' ' + c.args[1] : ''))).toEqual(['whoami', 'login', 'whoami', 'd1 create', 'deploy', 'deploy', 'secret bulk']);
-    expect(w.calls[1].interactive).toBe(true);
-    // The address Cloudflare gave is now the server's publicUrl (and the second deploy carries it).
+    expect(w.calls.map((c) => c.tool + ' ' + c.args.slice(0, 2).join(' '))).toEqual(['npm install --no-audit', 'cf auth whoami', 'cf auth login', 'cf auth whoami', 'cf d1 list', 'cf d1 create', 'cf deploy --mode', 'cf deploy --mode', 'cf workers secrets']);
+    expect(JSON.parse(w.calls[0].pkg!).devDependencies).toEqual({ cf: '1.0.0-beta.14', wrangler: '4.149.0' });
+    expect(w.calls[2].interactive).toBe(true);
     expect(JSON.parse(readFileSync(join(dir, 'token-server.json'), 'utf8')).publicUrl).toBe(r.url);
-    const deployed = w.calls.filter((c) => c.args[0] === 'deploy')[1].files!;
-    expect(deployed.toml).toContain('database_id = "11111111-2222-3333-4444-555555555555"');
-    expect(deployed.toml).toContain('crons = ["*/5 * * * *"]');
-    expect(deployed.toml).not.toContain('AICW_EXTRA_STORE_KEYS');
+    const deployed = w.calls.filter((c) => c.args[0] === 'deploy')[1];
+    expect(deployed.config).toContain('DB: bindings.d1({ name: "aicw-tokens-test-tokens", id: "11111111-2222-3333-4444-555555555555" })');
+    expect(deployed.config).toContain('workersDev: true');
+    expect(deployed.config).toContain('triggers.scheduled({ schedule: "*/5 * * * *" })');
+    expect(deployed.config).not.toContain('AICW_EXTRA_STORE_KEYS');
     expect(deployed.worker).toMatch(/import \{ createWorker \} from '.*src\/worker\.ts';\nimport config from '\.\.\/token-server\.json';\nexport default createWorker\(config\);/);
-    // The key went to Cloudflare as a secret; the temporary file is gone.
-    expect(w.calls.find((c) => c.args[0] === 'secret')!.secrets).toEqual({ OPENAI_API_KEY: 'sk-test-123' });
+    expect(w.calls.at(-1)!.secrets).toEqual({ secrets: { OPENAI_API_KEY: { type: 'secret_text', name: 'OPENAI_API_KEY', text: 'sk-test-123' } } });
     expect(existsSync(join(dir, '.aicw-deploy', '.secrets.json'))).toBe(false);
     expect(lines.at(-1)).toContain('Next: register it in the AICW Store');
   });
-  it('reuses an existing database, deploys once when publicUrl is already right', async () => {
+  it('reuses an existing database, deploys once when publicUrl is already right, adds a test key only when asked', async () => {
     const dir = project({ publicUrl: 'https://aicw-tokens-test-tokens.acme.workers.dev' });
-    const w = fakeWrangler({ existingDb: true });
-    const r = await deployCloudflare({ configPath: join(dir, 'token-server.json'), wrangler: w.run, fetch: answering, log: () => {} });
+    const w = fakeCf({ existingDb: true });
+    const r = await deployCloudflare({ configPath: join(dir, 'token-server.json'), run: w.run, fetch: answering, log: () => {}, testStoreKey: 'PUBKEY=' });
     expect(r.databaseId).toBe('99999999-2222-3333-4444-555555555555');
-    expect(w.calls.filter((c) => c.args[0] === 'deploy')).toHaveLength(1);
+    const deploys = w.calls.filter((c) => c.args[0] === 'deploy');
+    expect(deploys).toHaveLength(1);
+    expect(deploys[0].config).toContain('AICW_EXTRA_STORE_KEYS: bindings.text("PUBKEY=")');
+    expect(w.calls.some((c) => c.args[0] === 'auth' && c.args[1] === 'login')).toBe(false);
   });
   it('stops before touching Cloudflare when a key is missing or the config is broken', async () => {
-    const w = fakeWrangler();
-    await expect(deployCloudflare({ configPath: join(project({}, ''), 'token-server.json'), wrangler: w.run, fetch: answering, log: () => {} })).rejects.toThrow('put these keys in .env first: OPENAI_API_KEY');
-    await expect(deployCloudflare({ configPath: join(project({ providerId: 'Bad Id' }), 'token-server.json'), wrangler: w.run, fetch: answering, log: () => {} })).rejects.toThrow('providerId');
+    const w = fakeCf();
+    await expect(deployCloudflare({ configPath: join(project({}, ''), 'token-server.json'), run: w.run, fetch: answering, log: () => {} })).rejects.toThrow('put these keys in .env first: OPENAI_API_KEY');
+    await expect(deployCloudflare({ configPath: join(project({ providerId: 'Bad Id' }), 'token-server.json'), run: w.run, fetch: answering, log: () => {} })).rejects.toThrow('providerId');
     expect(w.calls).toEqual([]);
   });
   it('reads .env files the usual way', () => {

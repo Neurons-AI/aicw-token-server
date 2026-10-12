@@ -16,7 +16,8 @@ import { generateSigner, signerFromPkcs8 } from './crypto.ts';
 import { loadConfigFile, startNodeServer } from './node.ts';
 import { createTokenServer } from './server.ts';
 import { spawn } from 'node:child_process';
-import { deployCloudflare, DeployError, type WranglerRunner } from './deploy.ts';
+import { deployCloudflare, DeployError, type Runner } from './deploy.ts';
+import { join } from 'node:path';
 import { migrate } from './storage.ts';
 import { sqliteStorage } from './storage-sqlite.ts';
 
@@ -109,14 +110,16 @@ async function main(): Promise<number> {
       return 1;
     }
     const accountId = flag('account-id') ?? process.env.CLOUDFLARE_ACCOUNT_ID;
-    // wrangler 4 through npx: nothing to install by hand.
-    const wrangler: WranglerRunner = (wargs, opts) =>
+    // `cf` comes from .aicw-deploy/node_modules (installed by the deploy, pinned); npm from PATH.
+    const run: Runner = (tool, rargs, opts) =>
       new Promise((done) => {
-        const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--yes', 'wrangler@4', ...wargs], {
+        const win = process.platform === 'win32';
+        const bin = tool === 'cf' ? join(opts.cwd, 'node_modules', '.bin', win ? 'cf.cmd' : 'cf') : win ? 'npm.cmd' : 'npm';
+        const child = spawn(bin, rargs, {
           cwd: opts.cwd,
-          env: { ...process.env, ...(accountId ? { CLOUDFLARE_ACCOUNT_ID: accountId } : {}), WRANGLER_SEND_METRICS: 'false' },
+          env: { ...process.env, ...(accountId ? { CLOUDFLARE_ACCOUNT_ID: accountId } : {}) },
           stdio: opts.interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'],
-          shell: process.platform === 'win32',
+          shell: win,
         });
         let stdout = '';
         let stderr = '';
@@ -126,7 +129,7 @@ async function main(): Promise<number> {
         child.on('error', (e) => done({ code: 1, stdout, stderr: String(e) }));
       });
     try {
-      await deployCloudflare({ configPath: configPath(), envPath: flag('env'), name: flag('name'), accountId, testStoreKey: flag('test-store-key'), wrangler });
+      await deployCloudflare({ configPath: configPath(), envPath: flag('env'), name: flag('name'), accountId, testStoreKey: flag('test-store-key'), run });
       return 0;
     } catch (e) {
       console.error(e instanceof DeployError ? `\n${e.message}` : e);

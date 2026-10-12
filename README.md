@@ -37,14 +37,16 @@ a row stop your packs from selling). Then create **Token packs** that grant toke
 node ~/aicw-token-server/src/cli.ts deploy cloudflare [--name my-tokens] [--account-id <id>]
 ```
 
-It logs you in to Cloudflare (a browser window, once), creates a D1 database for the wallets, deploys
-a Worker named `aicw-tokens-<providerId>`, stores every key your adapters name (`apiKeyEnv`, read
+It uses the Cloudflare CLI [`cf`](https://developers.cloudflare.com/cf/) (installed for you in
+`.aicw-deploy/`, pinned): it signs you in to Cloudflare once (`cf auth login`: approve a one-time code
+in the browser; on a machine nobody sits at, set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`
+instead), creates a D1 database for the wallets, deploys a Worker named `aicw-tokens-<providerId>`, stores every key your adapters name (`apiKeyEnv`, read
 from `.env`) as Worker secrets, writes the `https://….workers.dev` address into `publicUrl`, and
 checks that it answers. Run it again after changing prices, models or keys. It writes
 `.aicw-deploy/` next to your config (keep it out of git with `.env`). The tables are created on the
 first request, so there is no migration step; D1 keeps a point-in-time history of the wallets
 (7 days on the free plan, 30 on a paid one). The Worker entry is `src/worker.ts`
-(`export default createWorker(config)`) if you prefer your own wrangler setup.
+(`export default createWorker(config)`) if you prefer your own `cf` or wrangler setup.
 
 ### Your own machine or VPS (Docker or Node)
 
