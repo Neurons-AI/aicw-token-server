@@ -67,6 +67,14 @@
       "./node": {
         "types": "./dist/node.d.ts",
         "import": "./dist/node.js"
+      },
+      "./worker": {
+        "types": "./dist/worker.d.ts",
+        "import": "./dist/worker.js"
+      },
+      "./deploy": {
+        "types": "./dist/deploy.d.ts",
+        "import": "./dist/deploy.js"
       }
     }
   },
