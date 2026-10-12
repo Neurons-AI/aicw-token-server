@@ -12,18 +12,23 @@ AI Coworker app ── Bearer sk-yourprefix-… (one key per device) ──▶ y
 
 ## Quick start (10 minutes)
 
-> Not on npm yet: run it from a clone (`git clone https://github.com/Neurons-AI/aicw-token-server ~/aicw-token-server && cd ~/aicw-token-server && pnpm install`) as `node src/cli.ts <command>`. Node 22.18 or newer (it runs the TypeScript sources directly).
+> Install from npm: [`aicw-token-server`](https://www.npmjs.com/package/aicw-token-server). Node 22.18 or
+> newer, nothing else.
 >
 > Not technical? Ask the agent in AI Coworker: "sell tokens for my app with my own server". It does
 > every step below; you only log in to Cloudflare once and click "Allow" in the app.
 
 ```bash
 mkdir my-tokens && cd my-tokens
-node ~/aicw-token-server/src/cli.ts init                # token-server.json + .env.example
+npm init -y && npm install aicw-token-server   # the version is pinned in this folder
+npx aicw-token-server init                     # token-server.json + .env.example
 # edit token-server.json (name, providerId, buckets, models, prices) and put your keys in .env
-node ~/aicw-token-server/src/cli.ts check --self        # the full conformance check in memory, costs nothing
-node ~/aicw-token-server/src/cli.ts deploy cloudflare   # online in a minute, see "Deploy"
+npx aicw-token-server check --self             # the full conformance check in memory, costs nothing
+npx aicw-token-server deploy cloudflare        # online in a minute, see "Deploy"
 ```
+
+Update: `npm install aicw-token-server@latest`, then `deploy cloudflare` again (same address, wallets kept).
+Working on the library itself: clone this repo, `pnpm install`, then `node src/cli.ts <command>`.
 
 Then in the AICW Store: **Developer → AI Token servers → Add and check** with the address it printed.
 The Store runs the same conformance check against your URL (again every week; three failed weeks in
@@ -34,7 +39,7 @@ a row stop your packs from selling). Then create **Token packs** that grant toke
 ### Cloudflare (recommended: one command, free plan is enough to start)
 
 ```bash
-node ~/aicw-token-server/src/cli.ts deploy cloudflare [--name my-tokens] [--account-id <id>]
+npx aicw-token-server deploy cloudflare [--name my-tokens] [--account-id <id>]
 ```
 
 It uses the Cloudflare CLI [`cf`](https://developers.cloudflare.com/cf/) (installed for you in
@@ -45,13 +50,13 @@ from `.env`) as Worker secrets, writes the `https://….workers.dev` address int
 checks that it answers. Run it again after changing prices, models or keys. It writes
 `.aicw-deploy/` next to your config (keep it out of git with `.env`). The tables are created on the
 first request, so there is no migration step; D1 keeps a point-in-time history of the wallets
-(7 days on the free plan, 30 on a paid one). The Worker entry is `src/worker.ts`
-(`export default createWorker(config)`) if you prefer your own `cf` or wrangler setup.
+(7 days on the free plan, 30 on a paid one). The Worker entry is `aicw-token-server/worker`
+(`import { createWorker } from 'aicw-token-server/worker'; export default createWorker(config)`) if you prefer your own `cf` or wrangler setup.
 
 ### Your own machine or VPS (Docker or Node)
 
 ```bash
-node ~/aicw-token-server/src/cli.ts start --port 8787     # SQLite file token-server.db next to it
+npx aicw-token-server start --port 8787        # SQLite file token-server.db next to it
 # or: docker build -t aicw-token-server . && docker run -v $PWD:/data --env-file .env -p 8787:8787 aicw-token-server
 ```
 
