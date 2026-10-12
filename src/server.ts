@@ -43,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.3.1' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.3.2' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
