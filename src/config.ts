@@ -40,6 +40,13 @@ export interface Price {
   /** image: tokens per image by quality; `edit` is added when reference images are sent. */
   quality?: Record<string, number>;
   edit?: number;
+  /**
+   * video: floor, wallet tokens per 1 million upstream tokens the job reports (BytePlus bills video by
+   * token, and an edit or extension also bills the source video): a job never costs less than that.
+   */
+  perMillionUpstreamTokens?: number;
+  /** video: the same for a job with a source / reference video (BytePlus bills those at a lower token rate). With it, such a job is charged by the tokens reported, not by seconds. */
+  perMillionUpstreamTokensWithVideo?: number;
   /** video: tokens per second by resolution. */
   resolution?: Record<string, number>;
   minSeconds?: number;
@@ -64,6 +71,8 @@ export interface ModelConfig {
   price?: Price;
   /** One sentence for buyers. */
   unit?: string;
+  /** What one use is called in the buyer's estimate (default by type: message, image, video, speech, request). */
+  estimateUnit?: import('./protocol.ts').EstimateUnit;
 }
 /** A wallet bucket. */
 export interface BucketConfig {

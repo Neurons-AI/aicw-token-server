@@ -137,6 +137,18 @@ answer says what the call cost (`usage.cost`). Use the `openai` adapter on
   runs your Worker follows the caller, so pass a `fetch` that sends those hosts through a Worker placed in
   the US (`[placement] region = "aws:us-east-1"`, reached by a service binding) — Neurons AI Cloud does this.
 
+## Music (Google Lyria) and video editing (Seedance)
+
+- **Music:** a `gemini` adapter model of type `other` (e.g. `lyria-3.5`, `lyria-3-clip-preview`) answers
+  `POST /v1/generate` with `{ model, input: { prompt, images?, lyrics? } }`: the MP3 itself, or with
+  `lyrics: true` JSON `{ audio: { mime, data }, lyrics }`. Price per song with `price.perRequest`; set
+  `"estimateUnit": "song"` so buyers see "about N songs". A refused prompt (no audio) costs nothing.
+- **Edit / extend a video (Seedance through `byteplus`):** `POST /v1/videos` also takes `videos` (https
+  URLs, or the id of a finished video this account made here, about a day), `audios` (https) and
+  `task`: `edit` (keeps the source length and ratio), `extend`, `reference` or `auto`. Such a job is held
+  for 30 s and charged by the tokens BytePlus reports: `price.perMillionUpstreamTokensWithVideo`
+  (wallet tokens per 1M tokens); `price.perMillionUpstreamTokens` is the floor for every other video.
+
 ## What buyers see: a quota and an estimate, not token counts
 
 The AICW Store and the app never show a buyer how many tokens they hold. Each wallet is a **quota**:

@@ -158,3 +158,93 @@ describe('a stream split mid-line', () => {
     expect(seen).toMatchObject({ aborted: false, usage: { prompt_tokens: 5, completion_tokens: 2 } });
   });
 });
+
+describe('Lyria music through /v1/generate', () => {
+  const MP3 = Buffer.from('ID3fake-mp3-bytes').toString('base64');
+  async function withLyria(answer: () => { status?: number; body: string }) {
+    const up = await upstream(() => ({ headers: { 'content-type': 'application/json' }, ...answer() }));
+    closers.push(up.close);
+    const h = await harness(
+      {
+        buckets: { music_tokens: { label: 'music' } },
+        adapters: { gemini: { kind: 'gemini', baseUrl: up.url + '/v1beta', apiKeyEnv: 'G' } },
+        models: [{ id: 'lyria-3.5', type: 'other', bucket: 'music_tokens', adapter: 'gemini', estimateUnit: 'song', price: { perRequest: 4000 } }],
+      },
+      { G: 'g-secret' }
+    );
+    return { up, h, a: await h.account({ music_tokens: 10_000 }) };
+  }
+  it('makes a song: the MP3 by default, MP3 + lyrics as JSON on request, 1 request = its price', async () => {
+    const { up, h, a } = await withLyria(() => ({ body: JSON.stringify({ candidates: [{ content: { parts: [{ text: '[Verse] Hà Nội ơi' }, { inlineData: { mimeType: 'audio/mpeg', data: MP3 } }] } }] }) }));
+    const plain = await h.api(a.key, '/generate', { model: 'lyria-3.5', input: { prompt: 'a happy pop song' } });
+    expect(plain.headers.get('content-type')).toBe('audio/mpeg');
+    expect(Buffer.from(await plain.arrayBuffer()).toString()).toBe('ID3fake-mp3-bytes');
+    expect(up.calls[0].url).toBe('/v1beta/models/lyria-3.5:generateContent');
+    expect(JSON.parse(up.calls[0].body.toString())).toEqual({ contents: [{ role: 'user', parts: [{ text: 'a happy pop song' }] }] });
+    const withLyrics = (await (await h.api(a.key, '/generate', { model: 'lyria-3.5', input: { prompt: 'again', lyrics: true } })).json()) as any;
+    expect(withLyrics).toEqual({ audio: { mime: 'audio/mpeg', data: MP3 }, lyrics: '[Verse] Hà Nội ơi' });
+    expect((await a.wallet()).balances.music_tokens).toBe(10_000 - 8000);
+    // The buyer sees "about N songs".
+    const est = (await (await h.f('http://tokens.test/.well-known/aicw-token-server')).json()) as any;
+    expect(est.buckets[0].estimate).toEqual({ unit: 'song', model: 'lyria-3.5', each: 4000 });
+  });
+  it('a refused prompt (no audio) costs nothing', async () => {
+    const { h, a } = await withLyria(() => ({ body: JSON.stringify({ candidates: [{ content: { parts: [{ text: 'I cannot make that.' }] } }] }) }));
+    const res = await h.api(a.key, '/generate', { model: 'lyria-3.5', input: { prompt: 'sing like a famous star' } });
+    expect(res.status).toBe(400);
+    expect((await a.wallet()).balances.music_tokens).toBe(10_000);
+  });
+});
+
+describe('Seedance: edit or extend a video', () => {
+  it('sends reference videos, resolves a video made here to its file, and charges at least the tokens BytePlus reports', async () => {
+    let task = 0;
+    const tasks: Record<string, any> = {};
+    const up = await upstream((req, body) => {
+      if (req.method === 'POST') {
+        const id = 'cgt-' + ++task;
+        tasks[id] = JSON.parse(body.toString());
+        return { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) };
+      }
+      const id = req.url!.split('/').pop()!;
+      // The first job is a plain video; the edit reports many tokens (its source video is billed too).
+      return { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, status: 'succeeded', content: { video_url: `https://cdn.byteplus.test/${id}.mp4` }, usage: { completion_tokens: id === 'cgt-1' ? 40_000 : 120_000, total_tokens: id === 'cgt-1' ? 40_000 : 120_000 } }) };
+    });
+    closers.push(up.close);
+    const h = await harness(
+      {
+        buckets: { video_tokens: { label: 'video' } },
+        adapters: { ark: { kind: 'byteplus', baseUrl: up.url + '/api/v3', apiKeyEnv: 'B' } },
+        // 1 token per second at 480p; floor: 142 wallet tokens per 1M upstream tokens.
+        models: [{ id: 'seedance-2.5', type: 'video', bucket: 'video_tokens', adapter: 'ark', price: { resolution: { '480p': 1, '720p': 2 }, perMillionUpstreamTokens: 142, perMillionUpstreamTokensWithVideo: 85 } }],
+      },
+      { B: 'bp-secret' }
+    );
+    const a = await h.account({ video_tokens: 1000 });
+    const made = (await (await h.api(a.key, '/videos', { model: 'seedance-2.5', prompt: 'a cat', resolution: '480p', seconds: 5 })).json()) as any;
+    expect(((await (await h.api(a.key, '/videos/' + made.id)).json()) as any).status).toBe('completed');
+    // 5 s at 480p = 5; 40,000 tokens × 142 / 1M = 5.68 → 6.
+    expect((await a.wallet()).balances.video_tokens).toBe(1000 - 6);
+
+    // Edit the video just made: its id becomes the provider file; pictures become references.
+    const edit = (await (await h.api(a.key, '/videos', { model: 'seedance-2.5', prompt: 'make it snow', resolution: '480p', seconds: 5, task: 'edit', videos: [made.id], images: ['https://pics.test/snow.png'] })).json()) as any;
+    // An edit keeps the source length and ratio.
+    expect(tasks['cgt-2']).toMatchObject({ duration: -1, ratio: 'adaptive', omni_reference_task_type: 'edit' });
+    // Held for the longest source (30 s) while it runs.
+    expect((await a.wallet()).held.video_tokens).toBe(30);
+    expect(tasks['cgt-2'].content).toEqual([
+      { type: 'text', text: 'make it snow' },
+      { type: 'image_url', image_url: { url: 'https://pics.test/snow.png' }, role: 'reference_image' },
+      { type: 'video_url', video_url: { url: 'https://cdn.byteplus.test/cgt-1.mp4' }, role: 'reference_video' },
+    ]);
+    await h.api(a.key, '/videos/' + edit.id);
+    // Charged by the tokens reported at the video-input rate: 120,000 × 85 / 1M = 10.2 → 11.
+    expect((await a.wallet()).balances.video_tokens).toBe(1000 - 6 - 11);
+
+    // Someone else's video id is refused before anything is reserved.
+    const b = await h.account({ video_tokens: 100 });
+    const refused = await h.api(b.key, '/videos', { model: 'seedance-2.5', prompt: 'steal', resolution: '480p', videos: [made.id] });
+    expect(refused.status).toBe(400);
+    expect((await b.wallet()).balances.video_tokens).toBe(100);
+  });
+});

@@ -28,7 +28,7 @@ export interface PublicModel {
   unit?: string;
 }
 /** What one typical use of a bucket is: a buyer sees "about N <unit>s", never a token count. */
-export type EstimateUnit = 'message' | 'image' | 'video' | 'speech' | 'request';
+export type EstimateUnit = 'message' | 'image' | 'video' | 'speech' | 'song' | 'request';
 export interface BucketEstimate {
   unit: EstimateUnit;
   /** The model a typical use goes to. */

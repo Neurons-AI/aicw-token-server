@@ -6,6 +6,12 @@ export interface VideoInput {
   prompt: string;
   /** http(s) or data: URLs; the first one is the starting frame. */
   images: string[];
+  /** https URLs of videos to edit, extend or take from (the first one is the source video). */
+  videos?: string[];
+  /** https URLs of audio to follow (music, a voice). */
+  audios?: string[];
+  /** With a reference video: what to do with it (BytePlus omni_reference_task_type). edit/extend keep the source ratio and length. */
+  task?: 'auto' | 'reference' | 'edit' | 'extend';
   resolution: string;
   seconds: number;
   ratio?: string;
@@ -16,6 +22,8 @@ export interface VideoState {
   /** Where the finished file is, if the upstream hands out a URL (kept server-side). */
   ref?: string;
   error?: string;
+  /** Upstream tokens the job used (BytePlus reports them), for the price floor. */
+  usageTokens?: number;
 }
 export interface Adapter {
   /** Send an OpenAI-shaped request upstream and hand the raw response back. */

@@ -43,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.5.0' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.7.0' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
@@ -398,10 +398,11 @@ export function createTokenServer(deps: TokenServerDeps) {
     hold: number;
     upstream_id: string | null;
     upstream_ref: string | null;
+    usage_json?: string | null;
     error: string | null;
     created_at: string;
   }
-  const videoRow = (id: string) => db.first<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at FROM ts_requests WHERE id=? AND kind='video'", id);
+  const videoRow = (id: string) => db.first<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at,usage_json FROM ts_requests WHERE id=? AND kind='video'", id);
   /** Ask the upstream where a job is, and settle or release the hold when it has ended. */
   async function advanceVideo(row: VideoRow, test: boolean): Promise<VideoJob> {
     const job = (status: VideoJob['status'], extra: Partial<VideoJob> = {}): VideoJob => ({ id: row.id, object: 'video', model: row.model, status, ...extra });
@@ -420,7 +421,15 @@ export function createTokenServer(deps: TokenServerDeps) {
     }
     if (state.status === 'completed') {
       await db.run('UPDATE ts_requests SET upstream_ref=? WHERE id=?', state.ref ?? null, row.id);
-      await settle(db, row.id, row.hold, { video: true });
+      // Never below what the upstream says the job used (an edit or extension also bills its source video).
+      const withVideo = /"withVideo":true/.test(String(row.usage_json ?? ''));
+      const perVideo = m?.price?.perMillionUpstreamTokensWithVideo;
+      const per = m?.price?.perMillionUpstreamTokens;
+      const byTokens = (rate: number | undefined) => (rate && state.usageTokens ? Math.ceil((state.usageTokens / 1_000_000) * rate) : 0);
+      // A job with a source video is charged by the tokens reported (its length is known only now);
+      // any other job by seconds, and never below the tokens reported.
+      const charge = withVideo && perVideo && state.usageTokens ? byTokens(perVideo) : Math.max(row.hold, byTokens(per));
+      await settle(db, row.id, charge, { video: true, ...(withVideo ? { withVideo: true } : {}), ...(state.usageTokens ? { upstreamTokens: state.usageTokens } : {}) });
       return done();
     }
     if (state.status === 'failed') {
@@ -439,14 +448,31 @@ export function createTokenServer(deps: TokenServerDeps) {
     if (m.price?.resolution && !(resolution in m.price.resolution)) throw bad(`resolution must be one of ${Object.keys(m.price.resolution).join(', ')}`);
     const seconds = videoSeconds(m, body.duration ?? body.seconds);
     const images = (Array.isArray(body.images) ? body.images : body.image ? [body.image] : []).filter((x: unknown): x is string => typeof x === 'string' && /^(https?:|data:image\/)/.test(x)).slice(0, 4);
+    // Videos to edit / extend / follow: an https URL, or the id of a video this account made here
+    // (its file stays with the provider for about a day). Audio: https URLs.
+    const videos: string[] = [];
+    for (const v of (Array.isArray(body.videos) ? body.videos : body.video ? [body.video] : []).slice(0, 3)) {
+      const ref = str(v, 2000).trim();
+      if (/^https:\/\//.test(ref)) videos.push(ref);
+      else if (ref) {
+        const own = await videoRow(ref.replace(/^.*\/videos\/([^/]+)(\/content)?$/, '$1'));
+        if (!own || own.account_ref !== c.get('key').account_ref || own.status !== 'done' || !own.upstream_ref) throw bad(`video "${ref.slice(0, 80)}": use an https:// address or the id of a finished video you made here (kept about a day)`);
+        videos.push(own.upstream_ref);
+      }
+    }
+    const audios = (Array.isArray(body.audios) ? body.audios : []).filter((x: unknown): x is string => typeof x === 'string' && /^https:\/\//.test(x)).slice(0, 3);
+    if ((videos.length || audios.length) && adapterFor(c, m).video && config.adapters[m.adapter]?.kind !== 'byteplus' && config.adapters[m.adapter]?.kind !== 'mock') throw bad(`the model "${m.id}" cannot take reference videos or audio`);
     const open = await db.first<{ n: number }>("SELECT COUNT(*) AS n FROM ts_requests WHERE account_ref=? AND kind='video' AND status='held'", c.get('key').account_ref);
     if ((open?.n ?? 0) >= limits.maxOpenVideos) throw new HttpError(429, 'too_many_videos', `${limits.maxOpenVideos} videos are already being made; wait for one to finish`);
     const video = adapterFor(c, m).video;
     if (!video) throw new HttpError(503, 'upstream_not_configured', `the "${m.adapter}" adapter cannot make videos`);
-    const h = await reserve(c, m, tokensForVideo(m, resolution, seconds), 'exact', 'video');
+    const task = ['auto', 'reference', 'edit', 'extend'].includes(String(body.task)) ? (body.task as 'auto' | 'reference' | 'edit' | 'extend') : undefined;
+    // With a source video the length is the provider's (an edit keeps the source's, up to 30 s): hold for the longest.
+    const holdSeconds = videos.length ? Math.max(seconds, 30) : seconds;
+    const h = await reserve(c, m, tokensForVideo(m, resolution, holdSeconds), 'exact', 'video');
     return guarded(h.requestId, async () => {
-      const made = await video.create({ model: upstreamModel(m), prompt, images, resolution, seconds, ratio: str(body.ratio ?? body.aspect_ratio, 10) || undefined });
-      await db.run('UPDATE ts_requests SET upstream_id=?,usage_json=? WHERE id=?', made.id, JSON.stringify({ resolution, seconds }), h.requestId);
+      const made = await video.create({ model: upstreamModel(m), prompt, images, ...(videos.length ? { videos } : {}), ...(audios.length ? { audios } : {}), ...(task ? { task } : {}), resolution, seconds, ratio: str(body.ratio ?? body.aspect_ratio, 10) || undefined });
+      await db.run('UPDATE ts_requests SET upstream_id=?,usage_json=? WHERE id=?', made.id, JSON.stringify({ resolution, seconds, ...(videos.length ? { withVideo: true } : {}) }), h.requestId);
       const job: VideoJob = { id: h.requestId, object: 'video', model: m.id, status: 'queued' };
       return await withBalance(c, Response.json(job), m.bucket, h.balanceAfter);
     });
@@ -604,7 +630,7 @@ export function createTokenServer(deps: TokenServerDeps) {
     let released = 0;
     const stamp = nowIso();
     await db.run('DELETE FROM ts_rate WHERE expires_at<?', stamp);
-    const open = await db.all<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at FROM ts_requests WHERE kind='video' AND status='held' AND created_at<? LIMIT 50", new Date(Date.now() - 60_000).toISOString());
+    const open = await db.all<VideoRow>("SELECT id,account_ref,model,bucket,status,hold,upstream_id,upstream_ref,error,created_at,usage_json FROM ts_requests WHERE kind='video' AND status='held' AND created_at<? LIMIT 50", new Date(Date.now() - 60_000).toISOString());
     for (const row of open) {
       const job = await advanceVideo(row, await isTestAccount(db, row.account_ref));
       if (job.status === 'completed' || job.status === 'failed') videos++;

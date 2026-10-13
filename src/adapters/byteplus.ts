@@ -26,17 +26,31 @@ export function byteplusAdapter(deps: AdapterDeps): Adapter {
     video: {
       async create(input) {
         const content: Array<Record<string, unknown>> = [{ type: 'text', text: input.prompt }];
-        for (const [i, url] of input.images.entries()) content.push({ type: 'image_url', image_url: { url }, ...(i === 0 ? { role: 'first_frame' } : { role: 'reference_image' }) });
+        const videos = input.videos ?? [];
+        // With a source video (edit / extend) every picture is a reference, not the first frame.
+        for (const [i, url] of input.images.entries()) content.push({ type: 'image_url', image_url: { url }, role: i === 0 && !videos.length ? 'first_frame' : 'reference_image' });
+        for (const url of videos) content.push({ type: 'video_url', video_url: { url }, role: 'reference_video' });
+        for (const url of input.audios ?? []) content.push({ type: 'audio_url', audio_url: { url }, role: 'reference_audio' });
         const data = await call('/contents/generations/tasks', {
           method: 'POST',
-          body: JSON.stringify({ model: input.model, content, resolution: input.resolution, duration: input.seconds, ...(input.ratio ? { ratio: input.ratio } : {}), watermark: false }),
+          body: JSON.stringify({
+            model: input.model,
+            content,
+            resolution: input.resolution,
+            // An edit keeps the source length (-1) and ratio; an extension keeps the ratio.
+            duration: input.task === 'edit' ? -1 : input.seconds,
+            ...(videos.length && (input.task === 'edit' || input.task === 'extend') ? { ratio: 'adaptive' } : input.ratio ? { ratio: input.ratio } : {}),
+            ...(videos.length && input.task ? { omni_reference_task_type: input.task } : {}),
+            watermark: false,
+          }),
         });
         return { id: String(data.id) };
       },
       async status(id): Promise<VideoState> {
         const d = await call(`/contents/generations/tasks/${encodeURIComponent(id)}`, { method: 'GET' });
         const s = String(d.status || '');
-        if (s === 'succeeded') return { status: 'completed', progress: 100, ref: String(d.content?.video_url || '') };
+        const usageTokens = Number(d.usage?.total_tokens ?? d.usage?.completion_tokens) || undefined;
+        if (s === 'succeeded') return { status: 'completed', progress: 100, ref: String(d.content?.video_url || ''), ...(usageTokens ? { usageTokens } : {}) };
         if (s === 'failed' || s === 'cancelled' || s === 'expired') return { status: 'failed', error: String(d.error?.message || s) };
         return { status: s === 'queued' ? 'queued' : 'in_progress' };
       },

@@ -23,7 +23,7 @@ export const DEFAULT_CHAT_PROFILE = { input: 6_000, cacheRead: 60_000, output: 2
 export function fullPrice(model: ModelConfig): Price {
   const p = model.price ?? {};
   // The cost floor is the operator's, never the Store's: it stays whatever price is laid over it.
-  const floor = { ...(p.perUsd ? { perUsd: p.perUsd } : {}), ...(p.longContext ? { longContext: { ...p.longContext } } : {}) };
+  const floor = { ...(p.perUsd ? { perUsd: p.perUsd } : {}), ...(p.longContext ? { longContext: { ...p.longContext } } : {}), ...(p.perMillionUpstreamTokens ? { perMillionUpstreamTokens: p.perMillionUpstreamTokens } : {}), ...(p.perMillionUpstreamTokensWithVideo ? { perMillionUpstreamTokensWithVideo: p.perMillionUpstreamTokensWithVideo } : {}) };
   switch (model.type) {
     case 'chat':
       return { input: p.input ?? 1, output: p.output ?? 1, cacheRead: p.cacheRead ?? p.input ?? 1, ...(p.cacheWrite !== undefined ? { cacheWrite: p.cacheWrite } : {}), defaultHold: p.defaultHold ?? 16_000, ...floor };
@@ -32,7 +32,7 @@ export function fullPrice(model: ModelConfig): Price {
     case 'image':
       return { quality: { ...(p.quality ?? DEFAULT_QUALITY) }, edit: p.edit ?? 0, ...floor };
     case 'video':
-      return { resolution: { ...(p.resolution ?? DEFAULT_RESOLUTION) }, minSeconds: p.minSeconds ?? 4, maxSeconds: p.maxSeconds ?? 12, defaultSeconds: p.defaultSeconds ?? 5 };
+      return { resolution: { ...(p.resolution ?? DEFAULT_RESOLUTION) }, minSeconds: p.minSeconds ?? 4, maxSeconds: p.maxSeconds ?? 12, defaultSeconds: p.defaultSeconds ?? 5, ...floor };
     case 'tts':
       return { per1kChars: p.per1kChars ?? 1 };
     default:
@@ -245,7 +245,7 @@ export function liveCatalog(config: TokenServerConfig, o: Overrides): LiveCatalo
     if (!model) continue;
     const price = fullPrice(model);
     profiles[id] = fullProfile(model, price, profile) as EstimateProfile & { model: string };
-    estimates[id] = { unit: UNIT[model.type], model: model.id, each: estimateEach(model, price, profile), ...(profiles[id].video ? { seconds: profiles[id].video!.seconds, resolution: profiles[id].video!.resolution } : {}), ...(profiles[id].image ? { quality: profiles[id].image!.quality } : {}) };
+    estimates[id] = { unit: model.estimateUnit ?? UNIT[model.type], model: model.id, each: estimateEach(model, price, profile), ...(profiles[id].video ? { seconds: profiles[id].video!.seconds, resolution: profiles[id].video!.resolution } : {}), ...(profiles[id].image ? { quality: profiles[id].image!.quality } : {}) };
   }
   return { models, estimates, profiles };
 }
