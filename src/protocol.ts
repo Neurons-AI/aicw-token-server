@@ -26,6 +26,12 @@ export interface PublicModel {
   bucket: string;
   /** One sentence a buyer can read: "1 token = 1 image at medium quality". */
   unit?: string;
+  /** chat: what the app should know to use the model well (context window, longest answer, picture input, thinking). */
+  name?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  input?: Array<'text' | 'image'>;
+  reasoning?: boolean;
 }
 /** What one typical use of a bucket is: a buyer sees "about N <unit>s", never a token count. */
 export type EstimateUnit = 'message' | 'image' | 'video' | 'speech' | 'song' | 'request';

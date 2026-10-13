@@ -71,6 +71,12 @@ export interface ModelConfig {
   price?: Price;
   /** One sentence for buyers. */
   unit?: string;
+  /** chat: shown to the app (PublicModel): display name, context window, longest answer, picture input, thinking. */
+  name?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  input?: Array<'text' | 'image'>;
+  reasoning?: boolean;
   /** What one use is called in the buyer's estimate (default by type: message, image, video, speech, request). */
   estimateUnit?: import('./protocol.ts').EstimateUnit;
 }
