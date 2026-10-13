@@ -43,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.4.0' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.5.0' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
@@ -263,9 +263,17 @@ export function createTokenServer(deps: TokenServerDeps) {
       if (data.model) data.model = m.id;
       return await withBalance(c, Response.json(scrubUpstreamCost(data)), m.bucket, balance);
     }
+    // On Workers the isolate may stop once the buyer has the last byte and hangs up: keep it alive
+    // until the call is settled, or the hold would be swept back uncharged.
+    let settled!: () => void;
+    keepAlive(c, new Promise<void>((resolve) => (settled = resolve)));
     return new Response(meterSse(res.body!, async (seen) => {
-      const usage = readChatUsage(seen.usage);
-      await settle(db, h.requestId, usage ? chargeForChat(m, usage) : estimateTokens(promptChars + seen.outputChars), seen.usage ?? { estimated: true, aborted: seen.aborted });
+      try {
+        const usage = readChatUsage(seen.usage);
+        await settle(db, h.requestId, usage ? chargeForChat(m, usage) : estimateTokens(promptChars + seen.outputChars), seen.usage ?? { estimated: true, aborted: seen.aborted });
+      } finally {
+        settled();
+      }
     }), { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', [balanceHeader(m.bucket)]: String(h.balanceAfter), [quotaHeader(m.bucket)]: String(await quotaOf(c.get('key').account_ref, m.bucket)) } });
   };
   app.post('/v1/chat/completions', chat('/chat/completions'));
@@ -623,6 +631,14 @@ export function createTokenServer(deps: TokenServerDeps) {
  * Pass an SSE stream through untouched while reading it: the last `usage` object seen and how
  * much text went out. `done` runs exactly once, when the stream ends or the client goes away.
  */
+/** `waitUntil` where the runtime has one (Workers); a no-op on Node, where the process stays up. */
+function keepAlive(c: { executionCtx?: unknown }, work: Promise<unknown>) {
+  try {
+    (c.executionCtx as { waitUntil?: (p: Promise<unknown>) => void } | undefined)?.waitUntil?.(work);
+  } catch {
+    /* Node: hono throws "This context has no ExecutionContext" */
+  }
+}
 /**
  * What the upstream charged us and which host served the call are the operator's business, not the
  * buyer's: OpenRouter puts both in every answer (`usage.cost`, `cost_details`, `is_byok`, `provider`).
@@ -703,9 +719,13 @@ export function meterSse(upstream: ReadableStream<Uint8Array>, done: (seen: { us
       /* the sweep gives the hold back */
     }
   };
+  // `[DONE]` is the end: settle there rather than wait for the stream to close (a forwarded body
+  // may stay open after it, and the buyer may hang up as soon as they have it).
+  let sawDone = false;
   const read = (line: string) => {
     if (!line.startsWith('data:')) return;
     const data = line.slice(5).trim();
+    if (data === '[DONE]') sawDone = true;
     if (!data || data === '[DONE]') return;
     try {
       const obj = JSON.parse(data) as Record<string, any>;
@@ -723,26 +743,34 @@ export function meterSse(upstream: ReadableStream<Uint8Array>, done: (seen: { us
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        const { value, done: end } = await reader.read();
-        if (end) {
-          if (buffer) {
-            read(buffer);
-            controller.enqueue(encoder.encode(scrubSseLine(buffer)));
+        // Keep reading until there is a whole line to pass on: a pull that enqueues nothing is not
+        // called again (an upstream that splits a line across chunks would stall the stream).
+        for (;;) {
+          const { value, done: end } = await reader.read();
+          if (end) {
+            if (buffer) {
+              read(buffer);
+              controller.enqueue(encoder.encode(scrubSseLine(buffer)));
+            }
+            await finish(false);
+            controller.close();
+            return;
           }
-          await finish(false);
-          controller.close();
-          return;
+          buffer += decoder.decode(value, { stream: true });
+          let nl;
+          let out = '';
+          while ((nl = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, nl);
+            read(line.trimEnd());
+            out += scrubSseLine(line) + '\n';
+            buffer = buffer.slice(nl + 1);
+          }
+          if (sawDone) await finish(false);
+          if (out) {
+            controller.enqueue(encoder.encode(out));
+            return;
+          }
         }
-        buffer += decoder.decode(value, { stream: true });
-        let nl;
-        let out = '';
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, nl);
-          read(line.trimEnd());
-          out += scrubSseLine(line) + '\n';
-          buffer = buffer.slice(nl + 1);
-        }
-        if (out) controller.enqueue(encoder.encode(out));
       } catch (e) {
         await finish(true);
         controller.error(e);

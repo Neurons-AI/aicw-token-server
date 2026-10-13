@@ -5,8 +5,8 @@
 import { MODEL_TYPES, type ModelType } from './protocol.ts';
 
 export interface AdapterConfig {
-  /** `openai`: any OpenAI-compatible API. `byteplus`: BytePlus ModelArk video (Seedance). `elevenlabs`: ElevenLabs speech. `mock`: canned answers. */
-  kind: 'openai' | 'byteplus' | 'elevenlabs' | 'mock' | (string & {});
+  /** `openai`: any OpenAI-compatible API. `anthropic`: Claude Messages API (translated, prompt-cached). `gemini`: Google Gemini (chat + Nano Banana images). `byteplus`: BytePlus ModelArk video (Seedance). `elevenlabs`: ElevenLabs speech. `mock`: canned answers. */
+  kind: 'openai' | 'anthropic' | 'gemini' | 'byteplus' | 'elevenlabs' | 'mock' | (string & {});
   baseUrl?: string;
   /** Name of the environment variable with the upstream API key. */
   apiKeyEnv?: string;
@@ -33,6 +33,8 @@ export interface Price {
    * the token prices so a pricier route, a long-context tier or cache writes never sell at a loss.
    */
   perUsd?: number;
+  /** chat: prices for a call whose prompt is longer than `above` tokens (the whole call, as Google bills Gemini Pro). */
+  longContext?: { above: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   /** chat: what to reserve when the request names no max_tokens. */
   defaultHold?: number;
   /** image: tokens per image by quality; `edit` is added when reference images are sent. */
@@ -118,7 +120,7 @@ export function validateConfig(raw: unknown, extraAdapterKinds: string[] = []): 
   const adapters = c.adapters && typeof c.adapters === 'object' ? c.adapters : {};
   for (const [id, a] of Object.entries(adapters)) {
     const kind = (a as AdapterConfig)?.kind;
-    if (!['openai', 'byteplus', 'elevenlabs', 'mock', ...extraAdapterKinds].includes(kind)) problems.push(`adapters.${id}.kind: openai, byteplus, elevenlabs, mock${extraAdapterKinds.length ? ', ' + extraAdapterKinds.join(', ') : ''}`);
+    if (!['openai', 'byteplus', 'elevenlabs', 'anthropic', 'gemini', 'mock', ...extraAdapterKinds].includes(kind)) problems.push(`adapters.${id}.kind: openai, byteplus, elevenlabs, anthropic, gemini, mock${extraAdapterKinds.length ? ', ' + extraAdapterKinds.join(', ') : ''}`);
     if (kind === 'openai' && !str((a as AdapterConfig)?.baseUrl)) problems.push(`adapters.${id}.baseUrl: the upstream API address`);
   }
   const seen = new Set<string>();

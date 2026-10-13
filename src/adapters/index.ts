@@ -1,12 +1,14 @@
 import type { TokenServerConfig } from '../config.ts';
+import { anthropicAdapter } from './anthropic.ts';
 import { byteplusAdapter } from './byteplus.ts';
 import { elevenlabsAdapter } from './elevenlabs.ts';
+import { geminiAdapter } from './gemini.ts';
 import { mockAdapter } from './mock.ts';
 import { openaiAdapter } from './openai.ts';
 import type { Adapter, AdapterDeps } from './types.ts';
 
 export type AdapterFactory = (deps: AdapterDeps) => Adapter;
-export const BUILTIN_ADAPTERS: Record<string, AdapterFactory> = { openai: openaiAdapter, byteplus: byteplusAdapter, elevenlabs: elevenlabsAdapter, mock: () => mockAdapter() };
+export const BUILTIN_ADAPTERS: Record<string, AdapterFactory> = { openai: openaiAdapter, byteplus: byteplusAdapter, elevenlabs: elevenlabsAdapter, anthropic: anthropicAdapter, gemini: geminiAdapter, mock: () => mockAdapter() };
 
 export function buildAdapters(config: TokenServerConfig, env: Record<string, string | undefined>, fetchImpl: typeof fetch, extra: Record<string, AdapterFactory> = {}): Record<string, Adapter> {
   const out: Record<string, Adapter> = {};

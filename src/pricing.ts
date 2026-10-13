@@ -18,11 +18,15 @@ export function readChatUsage(usage: unknown): ChatUsage | null {
   const output = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
   const cacheRead = Number(u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0) || 0;
   const cacheWrite = Number(u.prompt_tokens_details?.cache_write_tokens ?? 0) || 0;
-  const total = Number(u.total_tokens ?? 0) || input + output;
+  const reported = Number(u.total_tokens ?? 0) || 0;
+  const total = reported || input + output;
+  // Thinking a provider leaves out of completion_tokens but counts in the total (Gemini's
+  // OpenAI-compatible endpoint, xAI) is output too: it is billed at the output price.
+  const hidden = reported > input + output ? reported - input - output : 0;
   // What the upstream says the call cost in USD (OpenRouter), for the price floor.
   const cost = Number(u.cost);
   if (!input && !output && !total) return null;
-  return { input, output, cacheRead, cacheWrite, total, ...(Number.isFinite(cost) && cost > 0 ? { cost } : {}) };
+  return { input, output: output + hidden, cacheRead, cacheWrite, total, ...(Number.isFinite(cost) && cost > 0 ? { cost } : {}) };
 }
 export function chargeForChat(model: ModelConfig, usage: ChatUsage): number {
   const p = model.price ?? {};
@@ -32,7 +36,9 @@ export function chargeForChat(model: ModelConfig, usage: ChatUsage): number {
   if (!usage.input && !usage.output) return Math.max(floor, Math.ceil(usage.total * (p.output ?? 1)));
   const written = usage.cacheWrite ?? 0;
   const fresh = Math.max(0, usage.input - usage.cacheRead - written);
-  const byTokens = fresh * (p.input ?? 1) + usage.cacheRead * (p.cacheRead ?? p.input ?? 1) + written * (p.cacheWrite ?? p.input ?? 1) + usage.output * (p.output ?? 1);
+  // A long prompt may be billed at a higher tier for the whole call (Gemini Pro above 200k tokens).
+  const t = p.longContext && usage.input > p.longContext.above ? { ...p, ...p.longContext } : p;
+  const byTokens = fresh * (t.input ?? 1) + usage.cacheRead * (t.cacheRead ?? t.input ?? 1) + written * (t.cacheWrite ?? t.input ?? 1) + usage.output * (t.output ?? 1);
   return Math.max(floor, Math.ceil(byTokens));
 }
 /** About four characters per token: only for a reply cut off before the model reported usage. */

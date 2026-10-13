@@ -124,6 +124,19 @@ answer says what the call cost (`usage.cost`). Use the `openai` adapter on
 - `images: "chat"` on an adapter: `/images/generations` and `/images/edits` go through chat completions with `modalities: ["image","text"]` (quality `high` = 2K, otherwise 1K).
 - Buyers never see the upstream cost or which host served them: `usage.cost`, `cost_details`, `is_byok` and `provider` are removed from every answer, streamed or not.
 
+## Claude and Gemini direct (no 5.5% router fee)
+
+- `"kind": "anthropic"` (`apiKeyEnv`): Claude through the Messages API, translated to and from Chat
+  Completions (system, images, tools and tool results, streaming, thinking as `reasoning_content`) and
+  prompt-cached (system + last two messages). Usage carries cache reads and writes; set `price.cacheWrite`.
+- `"kind": "gemini"` (`apiKeyEnv`): chat through Google's OpenAI-compatible endpoint, Nano Banana
+  images (`gemini-*-image`) through `generateContent`. That endpoint leaves thinking out of
+  `completion_tokens`; the server bills `total_tokens − prompt − completion` as output. Gemini Pro bills
+  prompts above 200k tokens higher for the whole call: set `price.longContext: { above: 200000, input, output, cacheRead }`.
+- Both refuse API calls from some regions (Hong Kong among them). On Cloudflare Workers the edge that
+  runs your Worker follows the caller, so pass a `fetch` that sends those hosts through a Worker placed in
+  the US (`[placement] region = "aws:us-east-1"`, reached by a service binding) — Neurons AI Cloud does this.
+
 ## What buyers see: a quota and an estimate, not token counts
 
 The AICW Store and the app never show a buyer how many tokens they hold. Each wallet is a **quota**:
