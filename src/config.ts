@@ -13,6 +13,11 @@ export interface AdapterConfig {
   headers?: Record<string, string>;
   /** elevenlabs: the voice id used when a request names none. */
   voice?: string;
+  /**
+   * openai: `"chat"` makes images through chat completions with `modalities: ["image","text"]`
+   * (OpenRouter, Gemini image models) instead of `/images/generations` and `/images/edits`.
+   */
+  images?: 'chat';
 }
 /** How many wallet tokens one call costs. */
 export interface Price {
@@ -20,6 +25,14 @@ export interface Price {
   input?: number;
   output?: number;
   cacheRead?: number;
+  /** chat: wallet tokens per prompt token written to the provider's cache (default: `input`). */
+  cacheWrite?: number;
+  /**
+   * Safety net, wallet tokens per 1 USD: when the upstream reports what the call cost (OpenRouter's
+   * `usage.cost`), the charge is never below that cost × perUsd. Set it from the same formula as
+   * the token prices so a pricier route, a long-context tier or cache writes never sell at a loss.
+   */
+  perUsd?: number;
   /** chat: what to reserve when the request names no max_tokens. */
   defaultHold?: number;
   /** image: tokens per image by quality; `edit` is added when reference images are sent. */
@@ -42,6 +55,10 @@ export interface ModelConfig {
   adapter: string;
   /** The model name the upstream knows (default: `id`). */
   upstreamModel?: string;
+  /** Fields set on every upstream chat/image request for this model (e.g. OpenRouter `provider` routing); they win over the caller's. */
+  upstreamBody?: Record<string, unknown>;
+  /** `"anthropic"`: mark the prompt for Anthropic prompt caching (system + last messages), through OpenRouter. */
+  promptCache?: 'anthropic';
   price?: Price;
   /** One sentence for buyers. */
   unit?: string;

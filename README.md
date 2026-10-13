@@ -96,6 +96,34 @@ How many tokens a call costs (`price`):
 Tokens are **reserved before** the model is called and **charged after** it answers, with what it
 really used. A failed or refused call costs nothing. Two calls can never spend the same tokens.
 
+## Many models through OpenRouter, never below cost
+
+One OpenRouter key reaches Claude, Gemini, Kimi, GLM, DeepSeek and Gemini image models, and every
+answer says what the call cost (`usage.cost`). Use the `openai` adapter on
+`https://openrouter.ai/api/v1` and, per model:
+
+```json
+"adapters": {
+  "or":    { "kind": "openai", "baseUrl": "https://openrouter.ai/api/v1", "apiKeyEnv": "OPENROUTER_API_KEY" },
+  "orimg": { "kind": "openai", "baseUrl": "https://openrouter.ai/api/v1", "apiKeyEnv": "OPENROUTER_API_KEY", "images": "chat" }
+},
+"models": [
+  { "id": "claude-sonnet-5.5", "type": "chat", "bucket": "claude_tokens", "adapter": "or", "upstreamModel": "anthropic/claude-sonnet-5.5",
+    "promptCache": "anthropic", "price": { "input": 0.0982, "cacheRead": 0.0099, "cacheWrite": 0.1227, "output": 0.4907, "perUsd": 49068 } },
+  { "id": "glm-5.3", "type": "chat", "bucket": "glm_tokens", "adapter": "or", "upstreamModel": "z-ai/glm-5.3",
+    "upstreamBody": { "provider": { "max_price": { "prompt": 1.4, "completion": 4.4 } } }, "price": { "input": 0.0687, "output": 0.2159, "perUsd": 49068 } },
+  { "id": "gemini-3.1-flash-image", "type": "image", "bucket": "image_tokens", "adapter": "orimg", "upstreamModel": "google/gemini-3.1-flash-image",
+    "price": { "quality": { "low": 3300, "medium": 3300, "auto": 3300, "high": 5000 }, "edit": 100, "perUsd": 49068 } }
+]
+```
+
+- `price.perUsd` (wallet tokens per 1 USD): a call is never charged less than the reported cost × perUsd, whatever route, long-context tier or cache write it took. Set it from the same formula as your token prices.
+- `price.cacheWrite`: prompt tokens written to the provider's cache (Anthropic bills them above input).
+- `promptCache: "anthropic"`: marks the system prompt and the last messages for Anthropic prompt caching, so an agent's repeated prefix is a cache read on the next turn.
+- `upstreamBody`: fields set on every upstream request for that model (OpenRouter `provider` routing; `max_price` keeps a flat-priced model off pricier hosts).
+- `images: "chat"` on an adapter: `/images/generations` and `/images/edits` go through chat completions with `modalities: ["image","text"]` (quality `high` = 2K, otherwise 1K).
+- Buyers never see the upstream cost or which host served them: `usage.cost`, `cost_details`, `is_byok` and `provider` are removed from every answer, streamed or not.
+
 ## What buyers see: a quota and an estimate, not token counts
 
 The AICW Store and the app never show a buyer how many tokens they hold. Each wallet is a **quota**:

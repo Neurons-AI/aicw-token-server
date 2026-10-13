@@ -22,13 +22,15 @@ export const DEFAULT_CHAT_PROFILE = { input: 6_000, cacheRead: 60_000, output: 2
 /** A model's price with every default the metering code would use filled in. */
 export function fullPrice(model: ModelConfig): Price {
   const p = model.price ?? {};
+  // The cost floor is the operator's, never the Store's: it stays whatever price is laid over it.
+  const floor = p.perUsd ? { perUsd: p.perUsd } : {};
   switch (model.type) {
     case 'chat':
-      return { input: p.input ?? 1, output: p.output ?? 1, cacheRead: p.cacheRead ?? p.input ?? 1, defaultHold: p.defaultHold ?? 16_000 };
+      return { input: p.input ?? 1, output: p.output ?? 1, cacheRead: p.cacheRead ?? p.input ?? 1, ...(p.cacheWrite !== undefined ? { cacheWrite: p.cacheWrite } : {}), defaultHold: p.defaultHold ?? 16_000, ...floor };
     case 'embedding':
       return { input: p.input ?? 1 };
     case 'image':
-      return { quality: { ...(p.quality ?? DEFAULT_QUALITY) }, edit: p.edit ?? 0 };
+      return { quality: { ...(p.quality ?? DEFAULT_QUALITY) }, edit: p.edit ?? 0, ...floor };
     case 'video':
       return { resolution: { ...(p.resolution ?? DEFAULT_RESOLUTION) }, minSeconds: p.minSeconds ?? 4, maxSeconds: p.maxSeconds ?? 12, defaultSeconds: p.defaultSeconds ?? 5 };
     case 'tts':
@@ -39,7 +41,7 @@ export function fullPrice(model: ModelConfig): Price {
 }
 /** Which price fields the Store may set, by model type. Seconds limits are the operator's, not a price. */
 const SETTABLE: Record<ModelType, string[]> = {
-  chat: ['input', 'output', 'cacheRead', 'defaultHold'],
+  chat: ['input', 'output', 'cacheRead', 'cacheWrite', 'defaultHold'],
   embedding: ['input'],
   image: ['quality', 'edit'],
   video: ['resolution'],

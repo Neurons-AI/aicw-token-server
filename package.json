@@ -1,6 +1,6 @@
 {
   "name": "aicw-token-server",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Self-hosted AI Token API server for AI Coworker: per-device keys, prepaid token wallets, OpenAI-compatible endpoints, AICW Store fulfilment.",
   "license": "MIT",
   "type": "module",

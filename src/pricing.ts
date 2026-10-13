@@ -5,7 +5,10 @@ export interface ChatUsage {
   input: number;
   output: number;
   cacheRead: number;
+  cacheWrite?: number;
   total: number;
+  /** USD, when the upstream reports it. */
+  cost?: number;
 }
 /** Read the usage block of a Chat Completions or Responses answer. */
 export function readChatUsage(usage: unknown): ChatUsage | null {
@@ -14,16 +17,23 @@ export function readChatUsage(usage: unknown): ChatUsage | null {
   const input = Number(u.prompt_tokens ?? u.input_tokens ?? 0) || 0;
   const output = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
   const cacheRead = Number(u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0) || 0;
+  const cacheWrite = Number(u.prompt_tokens_details?.cache_write_tokens ?? 0) || 0;
   const total = Number(u.total_tokens ?? 0) || input + output;
+  // What the upstream says the call cost in USD (OpenRouter), for the price floor.
+  const cost = Number(u.cost);
   if (!input && !output && !total) return null;
-  return { input, output, cacheRead, total };
+  return { input, output, cacheRead, cacheWrite, total, ...(Number.isFinite(cost) && cost > 0 ? { cost } : {}) };
 }
 export function chargeForChat(model: ModelConfig, usage: ChatUsage): number {
   const p = model.price ?? {};
-  const fresh = Math.max(0, usage.input - usage.cacheRead);
+  // Never below what the upstream says it cost (perUsd from the price formula).
+  const floor = usage.cost && p.perUsd ? Math.ceil(usage.cost * p.perUsd) : 0;
   // A provider that reports only a total (no split) is charged on the total.
-  if (!usage.input && !usage.output) return Math.ceil(usage.total * (p.output ?? 1));
-  return Math.ceil(fresh * (p.input ?? 1) + usage.cacheRead * (p.cacheRead ?? p.input ?? 1) + usage.output * (p.output ?? 1));
+  if (!usage.input && !usage.output) return Math.max(floor, Math.ceil(usage.total * (p.output ?? 1)));
+  const written = usage.cacheWrite ?? 0;
+  const fresh = Math.max(0, usage.input - usage.cacheRead - written);
+  const byTokens = fresh * (p.input ?? 1) + usage.cacheRead * (p.cacheRead ?? p.input ?? 1) + written * (p.cacheWrite ?? p.input ?? 1) + usage.output * (p.output ?? 1);
+  return Math.max(floor, Math.ceil(byTokens));
 }
 /** About four characters per token: only for a reply cut off before the model reported usage. */
 export const estimateTokens = (chars: number) => Math.ceil(chars / 4);

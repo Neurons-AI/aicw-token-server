@@ -43,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.3.2' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.4.0' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
@@ -230,8 +230,9 @@ export function createTokenServer(deps: TokenServerDeps) {
     const promptChars = JSON.stringify(body.messages ?? body.input ?? '').length + JSON.stringify(body.tools ?? '').length + str(body.instructions, 1_000_000).length;
     const h = await reserve(c, m, holdForChat(m, body, promptChars), 'upTo', path === '/responses' ? 'responses' : 'chat');
     const stream = body.stream === true;
-    const send: Record<string, any> = { ...body, model: upstreamModel(m) };
+    const send: Record<string, any> = { ...body, ...(m.upstreamBody ?? {}), model: upstreamModel(m) };
     if (stream && path === '/chat/completions') send.stream_options = { ...(body.stream_options ?? {}), include_usage: true };
+    if (m.promptCache === 'anthropic' && Array.isArray(send.messages)) send.messages = markAnthropicCache(send.messages);
     // Never let one call spend more than was reserved for it.
     const cap = Math.max(1, Math.floor((h.amount - estimateTokens(promptChars) * (m.price?.input ?? 1)) / (m.price?.output ?? 1)));
     const maxField = path === '/responses' ? 'max_output_tokens' : body.max_tokens !== undefined && body.max_completion_tokens === undefined ? 'max_tokens' : 'max_completion_tokens';
@@ -260,7 +261,7 @@ export function createTokenServer(deps: TokenServerDeps) {
       const charged = usage ? chargeForChat(m, usage) : estimateTokens(promptChars + JSON.stringify(data.choices ?? data.output ?? '').length);
       const balance = await settle(db, h.requestId, charged, data.usage ?? { estimated: true });
       if (data.model) data.model = m.id;
-      return await withBalance(c, Response.json(data), m.bucket, balance);
+      return await withBalance(c, Response.json(scrubUpstreamCost(data)), m.bucket, balance);
     }
     return new Response(meterSse(res.body!, async (seen) => {
       const usage = readChatUsage(seen.usage);
@@ -303,13 +304,13 @@ export function createTokenServer(deps: TokenServerDeps) {
     const n = Math.max(1, Math.min(4, Math.trunc(Number(body.n)) || 1));
     const h = await reserve(c, m, tokensForImages(m, str(body.quality, 20), n, false), 'exact', 'image');
     return guarded(h.requestId, async () => {
-      const res = await adapterFor(c, m).forward('/images/generations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, n, model: upstreamModel(m) }) });
+      const res = await adapterFor(c, m).forward('/images/generations', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, ...(m.upstreamBody ?? {}), n, model: upstreamModel(m) }) });
       if (!res.ok) throw await upstreamFailure(res);
       const data = (await res.json()) as Record<string, any>;
       const made = Array.isArray(data?.data) ? data.data.length : 0;
       if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
-      const balance = await settle(db, h.requestId, tokensForImages(m, str(body.quality, 20), made, false), { images: made, quality: body.quality ?? 'auto' });
-      return await withBalance(c, Response.json(data), m.bucket, balance);
+      const balance = await settle(db, h.requestId, Math.max(tokensForImages(m, str(body.quality, 20), made, false), costFloor(m, data.usage)), { images: made, quality: body.quality ?? 'auto', ...(data.usage?.cost ? { cost: data.usage.cost } : {}) });
+      return await withBalance(c, Response.json(scrubUpstreamCost(data)), m.bucket, balance);
     });
   });
   app.post('/v1/images/edits', async (c) => {
@@ -328,8 +329,8 @@ export function createTokenServer(deps: TokenServerDeps) {
       const data = (await res.json()) as Record<string, any>;
       const made = Array.isArray(data?.data) ? data.data.length : 0;
       if (!made) throw new HttpError(502, 'no_image', 'the model returned no image (the prompt may have been refused); nothing was charged');
-      const balance = await settle(db, h.requestId, tokensForImages(m, quality, made, true), { images: made, quality: quality || 'auto', edit: true });
-      return await withBalance(c, Response.json(data), m.bucket, balance);
+      const balance = await settle(db, h.requestId, Math.max(tokensForImages(m, quality, made, true), costFloor(m, data.usage)), { images: made, quality: quality || 'auto', edit: true, ...(data.usage?.cost ? { cost: data.usage.cost } : {}) });
+      return await withBalance(c, Response.json(scrubUpstreamCost(data)), m.bucket, balance);
     });
   });
 
@@ -622,9 +623,73 @@ export function createTokenServer(deps: TokenServerDeps) {
  * Pass an SSE stream through untouched while reading it: the last `usage` object seen and how
  * much text went out. `done` runs exactly once, when the stream ends or the client goes away.
  */
+/**
+ * What the upstream charged us and which host served the call are the operator's business, not the
+ * buyer's: OpenRouter puts both in every answer (`usage.cost`, `cost_details`, `is_byok`, `provider`).
+ */
+export function scrubUpstreamCost<T>(data: T): T {
+  if (!data || typeof data !== 'object') return data;
+  const d = data as Record<string, any>;
+  delete d.provider;
+  for (const u of [d.usage, d.response?.usage]) {
+    if (u && typeof u === 'object') {
+      delete u.cost;
+      delete u.cost_details;
+      delete u.is_byok;
+    }
+  }
+  return data;
+}
+function scrubSseLine(line: string): string {
+  if (!line.startsWith('data:') || !/"(cost|provider|is_byok)"/.test(line)) return line;
+  try {
+    return 'data: ' + JSON.stringify(scrubUpstreamCost(JSON.parse(line.slice(5).trim())));
+  } catch {
+    return line;
+  }
+}
+/** Wallet tokens for what the upstream says a call cost (USD), when the model sets `price.perUsd`. */
+function costFloor(m: ModelConfig, usage: unknown): number {
+  const cost = Number((usage as { cost?: unknown } | null | undefined)?.cost);
+  return m.price?.perUsd && Number.isFinite(cost) && cost > 0 ? Math.ceil(cost * m.price.perUsd) : 0;
+}
+/**
+ * Anthropic prompt caching through OpenRouter: a `cache_control` breakpoint on the system prompt and
+ * on the last two messages (at most 4 are allowed), so an agent's long, repeated prefix is billed as
+ * a cache read on the next turn instead of fresh input.
+ */
+export function markAnthropicCache(messages: Array<Record<string, any>>): Array<Record<string, any>> {
+  const mark = (msg: Record<string, any>) => {
+    const parts = typeof msg.content === 'string' ? (msg.content ? [{ type: 'text', text: msg.content }] : []) : Array.isArray(msg.content) ? msg.content.map((p: unknown) => (p && typeof p === 'object' ? { ...(p as object) } : p)) : null;
+    if (!parts?.length) return msg;
+    const last = parts.length - 1;
+    for (let i = last; i >= 0; i--) {
+      const part = parts[i] as Record<string, any>;
+      if (part && part.type === 'text' && part.text) {
+        parts[i] = { ...part, cache_control: { type: 'ephemeral' } };
+        return { ...msg, content: parts };
+      }
+    }
+    return msg;
+  };
+  const out: Array<Record<string, any>> = messages.map((x) => ({ ...x, content: Array.isArray(x.content) ? x.content.map((p: any) => (p && typeof p === 'object' && 'cache_control' in p ? (({ cache_control: _c, ...rest }) => rest)(p) : p)) : x.content }));
+  const sys = out.findIndex((x) => x.role === 'system' || x.role === 'developer');
+  if (sys >= 0) out[sys] = mark(out[sys]);
+  let marked = 0;
+  for (let i = out.length - 1; i >= 0 && marked < 2; i--) {
+    if (i === sys || out[i].role === 'tool') continue;
+    const next = mark(out[i]);
+    if (next !== out[i]) {
+      out[i] = next;
+      marked++;
+    }
+  }
+  return out;
+}
 export function meterSse(upstream: ReadableStream<Uint8Array>, done: (seen: { usage: unknown; outputChars: number; aborted: boolean }) => Promise<void>): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   let buffer = '';
   let usage: unknown = null;
   let outputChars = 0;
@@ -660,18 +725,24 @@ export function meterSse(upstream: ReadableStream<Uint8Array>, done: (seen: { us
       try {
         const { value, done: end } = await reader.read();
         if (end) {
-          if (buffer) read(buffer);
+          if (buffer) {
+            read(buffer);
+            controller.enqueue(encoder.encode(scrubSseLine(buffer)));
+          }
           await finish(false);
           controller.close();
           return;
         }
         buffer += decoder.decode(value, { stream: true });
         let nl;
+        let out = '';
         while ((nl = buffer.indexOf('\n')) >= 0) {
-          read(buffer.slice(0, nl).trimEnd());
+          const line = buffer.slice(0, nl);
+          read(line.trimEnd());
+          out += scrubSseLine(line) + '\n';
           buffer = buffer.slice(nl + 1);
         }
-        controller.enqueue(value);
+        if (out) controller.enqueue(encoder.encode(out));
       } catch (e) {
         await finish(true);
         controller.error(e);
