@@ -51,6 +51,8 @@ export interface PublicBucket {
   id: string;
   label: string;
   estimate?: BucketEstimate;
+  /** Where a buyer gets more of this bucket (an aicoworker://store/skills/<pack> link). */
+  topup?: string;
 }
 export interface ServerManifest {
   protocol: number;

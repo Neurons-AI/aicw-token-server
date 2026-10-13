@@ -43,7 +43,7 @@ import {
 import type { Storage } from './storage.ts';
 import { adjust, balances, ensureAccount, grantReceipt, hold, isTestAccount, refundReceipt, release, settle, usageSummary, WalletError } from './wallet.ts';
 
-export const LIBRARY = { name: 'aicw-token-server', version: '0.8.0' };
+export const LIBRARY = { name: 'aicw-token-server', version: '0.8.1' };
 
 export interface TokenServerDeps {
   config: TokenServerConfig;
@@ -91,7 +91,7 @@ export function createTokenServer(deps: TokenServerDeps) {
   }
   const describe = (catalog: LiveCatalog): Live => {
     const models: PublicModel[] = catalog.models.map((m) => ({ id: m.id, type: m.type, bucket: m.bucket, ...(m.unit ? { unit: m.unit } : {}), ...(m.name ? { name: m.name } : {}), ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}), ...(m.maxOutputTokens ? { maxOutputTokens: m.maxOutputTokens } : {}), ...(m.input ? { input: m.input } : {}), ...(m.reasoning !== undefined ? { reasoning: m.reasoning } : {}) }));
-    const buckets: PublicBucket[] = Object.entries(config.buckets).map(([id, b]) => ({ id, label: b.label, ...(catalog.estimates[id] ? { estimate: catalog.estimates[id] } : {}) }));
+    const buckets: PublicBucket[] = Object.entries(config.buckets).map(([id, b]) => ({ id, label: b.label, ...(catalog.estimates[id] ? { estimate: catalog.estimates[id] } : {}), ...(b.topup ? { topup: b.topup } : {}) }));
     return {
       catalog,
       models,
